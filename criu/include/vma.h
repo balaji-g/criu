@@ -13,6 +13,7 @@ struct vm_area_list {
 	struct list_head h;   /* list of VMAs */
 	unsigned nr;	      /* nr of all VMAs in the list */
 	unsigned int nr_aios; /* nr of AIOs VMAs in the list */
+	unsigned int nr_iourings; /* nr of io_uring VMAs in the list */
 	union {
 		unsigned long nr_priv_pages; /* dmp: nr of pages in private VMAs */
 		unsigned long rst_priv_size; /* rst: size of private VMAs */
@@ -36,6 +37,7 @@ struct vma_area {
 	union {
 		struct /* for dump */ {
 			int vm_socket_id;
+			unsigned long vm_iouring_ino; /* io_uring inode number */
 
 			char *aufs_rpath; /* path from aufs root */
 			char *aufs_fpath; /* full path from global root */

@@ -83,6 +83,12 @@ static bool uprobes_vma_exists = false;
 
 #define AIO_FNAME "/[aio]"
 
+/*
+ * This is how io_uring ring buffers look like in proc
+ */
+
+#define IOURING_FNAME "anon_inode:[io_uring]"
+
 /* check the @line starts with "%lx-%lx" format */
 static bool __is_vma_range_fmt(char *line)
 {
@@ -496,6 +502,16 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
 				/* AIO ring, let's try */
 				close_safe(vm_file_fd);
 				vma->e->status = VMA_AREA_AIORING;
+				return 0;
+			}
+
+			if ((buf.st_mode & S_IFMT) == 0 && !strcmp(fname, IOURING_FNAME)) {
+				/* io_uring ring buffer */
+				pr_info("Found io_uring mapping @%" PRIx64 " (ino %lu)\n",
+					vma->e->start, (unsigned long)buf.st_ino);
+				close_safe(vm_file_fd);
+				vma->e->status = VMA_AREA_IOURING;
+				vma->vm_iouring_ino = buf.st_ino;
 				return 0;
 			}
 
@@ -913,6 +929,8 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 				goto err;
 		} else if (vma_entry_is(vma_area->e, VMA_AREA_AIORING))
 			vma_area_list->nr_aios++;
+		else if (vma_entry_is(vma_area->e, VMA_AREA_IOURING))
+			vma_area_list->nr_iourings++;
 	}
 
 	vma_area = NULL;

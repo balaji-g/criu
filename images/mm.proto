@@ -4,6 +4,7 @@ syntax = "proto2";
 
 import "opts.proto";
 import "vma.proto";
+import "io_uring.proto";
 
 message aio_ring_entry {
 	required uint64	id		= 1;
@@ -32,4 +33,5 @@ message mm_entry {
 	optional int32	dumpable	= 15;
 	repeated aio_ring_entry	aios	= 16;
 	optional bool thp_disabled	= 17;
+	repeated io_uring_entry	io_urings	= 18;
 }

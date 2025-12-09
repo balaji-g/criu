@@ -25,6 +25,8 @@
 
 #include "images/mm.pb-c.h"
 
+struct rst_io_uring_ring;
+
 /*
  * These *must* be power of two values.
  */
@@ -183,6 +185,9 @@ struct task_restore_args {
 
 	struct rst_aio_ring *rings;
 	unsigned int rings_n;
+
+	struct rst_io_uring_ring *io_uring_rings;
+	unsigned int io_uring_rings_n;
 
 	struct rlimit64 *rlims;
 	unsigned int rlims_n;

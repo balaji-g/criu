@@ -74,6 +74,7 @@
 #include "sysfs_parse.h"
 #include "action-scripts.h"
 #include "aio.h"
+#include "io_uring.h"
 #include "lsm.h"
 #include "seccomp.h"
 #include "seize.h"
@@ -547,6 +548,13 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat, const struc
 		}
 	}
 
+	/* Dump io_uring rings */
+	if (vma_area_list->nr_iourings) {
+		ret = dump_io_uring(&mme, (struct vm_area_list *)vma_area_list, pid);
+		if (ret)
+			goto err;
+	}
+
 	mme.mm_start_code = stat->start_code;
 	mme.mm_end_code = stat->end_code;
 	mme.mm_start_data = stat->start_data;
@@ -581,6 +589,7 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat, const struc
 	ret = pb_write_one(img_from_set(imgset, CR_FD_MM), &mme, PB_MM);
 	xfree(mme.mm_saved_auxv);
 	free_aios(&mme);
+	free_io_urings(&mme);
 err:
 	xfree(mme.vmas);
 	return ret;

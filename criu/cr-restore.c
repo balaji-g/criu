@@ -69,6 +69,7 @@
 #include "action-scripts.h"
 #include "shmem.h"
 #include "aio.h"
+#include "io_uring.h"
 #include "lsm.h"
 #include "seccomp.h"
 #include "fault-injection.h"
@@ -650,6 +651,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 
 	if (prepare_aios(current, ta))
+		return -1;
+
+	if (prepare_io_urings(current, ta))
 		return -1;
 
 	if (fixup_sysv_shmems())

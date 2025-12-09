@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: MIT
+
+syntax = "proto2";
+
+import "opts.proto";
+
+/*
+ * io_uring checkpoint/restore support
+ *
+ * io_uring is Linux's modern async I/O interface using shared ring buffers.
+ * We need to save the ring configuration and state to restore it later.
+ */
+
+message io_uring_file_entry {
+	required uint32 id		= 1;	/* File descriptor number */
+	required uint64 ino		= 2;	/* Inode number (unique per ring) */
+}
+
+message io_uring_entry {
+	required uint32 id		= 1;	/* File descriptor number */
+	required uint64 ino		= 2;	/* Inode number */
+
+	/* Ring configuration (from io_uring_setup) */
+	required uint32 sq_entries	= 3;	/* Number of SQ entries */
+	required uint32 cq_entries	= 4;	/* Number of CQ entries */
+	required uint32 flags		= 5;	/* Setup flags */
+
+	/* SQ thread configuration */
+	optional int32 sq_thread_cpu	= 6;	/* CPU for SQ thread (-1 if none) */
+	optional uint32 sq_thread_idle	= 7;	/* SQ thread idle timeout */
+
+	/* Ring state at checkpoint time */
+	required uint32 sq_mask		= 10;	/* SQ ring mask */
+	required uint32 sq_head		= 11;	/* SQ head position */
+	required uint32 sq_tail		= 12;	/* SQ tail position */
+	required uint32 cached_sq_head	= 13;	/* Cached SQ head */
+
+	required uint32 cq_mask		= 20;	/* CQ ring mask */
+	required uint32 cq_head		= 21;	/* CQ head position */
+	required uint32 cq_tail		= 22;	/* CQ tail position */
+	required uint32 cached_cq_tail	= 23;	/* Cached CQ tail */
+
+	/* Pending entries (should be 0 for clean checkpoint) */
+	required uint32 sqes		= 30;	/* Pending SQEs */
+	required uint32 cqes		= 31;	/* Pending CQEs */
+
+	/* Memory mapping addresses */
+	required uint64 sq_ring_addr	= 40 [(criu).hex = true];
+	required uint64 cq_ring_addr	= 41 [(criu).hex = true];
+	required uint64 sqe_addr	= 42 [(criu).hex = true];
+
+	required uint64 sq_ring_size	= 43;
+	required uint64 cq_ring_size	= 44;
+	required uint64 sqe_size	= 45;
+
+	/* Registered resources */
+	optional uint32 user_files	= 50;	/* Number of registered files */
+	optional uint32 user_bufs	= 51;	/* Number of registered buffers */
+}
+

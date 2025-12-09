@@ -43,6 +43,7 @@
 #include "common/page.h"
 #include "restorer.h"
 #include "aio.h"
+#include "io_uring.h"
 #include "seccomp.h"
 
 #include "images/creds.pb-c.h"
@@ -1048,6 +1049,165 @@ populate:
 	return 0;
 }
 
+/* io_uring syscall numbers */
+#ifndef __NR_io_uring_setup
+#define __NR_io_uring_setup 425
+#endif
+
+/* io_uring mmap offsets */
+#define IORING_OFF_SQ_RING	0ULL
+#define IORING_OFF_CQ_RING	0x8000000ULL
+#define IORING_OFF_SQES		0x10000000ULL
+
+/*
+ * io_uring setup parameters (from linux/io_uring.h)
+ * We define this here to avoid including the full header.
+ */
+struct io_uring_params_rst {
+	__u32 sq_entries;
+	__u32 cq_entries;
+	__u32 flags;
+	__u32 sq_thread_cpu;
+	__u32 sq_thread_idle;
+	__u32 features;
+	__u32 wq_fd;
+	__u32 resv[3];
+	struct {
+		__u32 head;
+		__u32 tail;
+		__u32 ring_mask;
+		__u32 ring_entries;
+		__u32 flags;
+		__u32 dropped;
+		__u32 array;
+		__u32 resv1;
+		__u64 resv2;
+	} sq_off;
+	struct {
+		__u32 head;
+		__u32 tail;
+		__u32 ring_mask;
+		__u32 ring_entries;
+		__u32 overflow;
+		__u32 cqes;
+		__u32 flags;
+		__u32 resv1;
+		__u64 resv2;
+	} cq_off;
+};
+
+/*
+ * Restore an io_uring ring
+ *
+ * This creates a new io_uring instance and remaps its memory regions
+ * to the addresses where the application expects them.
+ */
+static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
+{
+	struct io_uring_params_rst params;
+	int fd;
+	long ret;
+	void *sq_ring_ptr, *sqe_ptr;
+
+	pr_info("Restoring io_uring ring: fd=%u sq=%u cq=%u\n",
+		ring->fd, ring->sq_entries, ring->cq_entries);
+
+	/* Clear params and set up the ring configuration */
+	builtin_memset(&params, 0, sizeof(params));
+	params.sq_entries = ring->sq_entries;
+	params.cq_entries = ring->cq_entries;
+	params.flags = ring->flags;
+
+	/* Create a new io_uring instance */
+	fd = sys_io_uring_setup(ring->sq_entries, &params);
+	if (fd < 0) {
+		pr_err("io_uring_setup failed: %d\n", fd);
+		return -1;
+	}
+
+	pr_debug("  Created io_uring fd=%d (wanted %u)\n", fd, ring->fd);
+
+	/*
+	 * Map the SQ/CQ rings at the target address
+	 * The kernel creates them at an arbitrary address, we need to
+	 * remap them to where the app expects them.
+	 *
+	 * First, we mmap the new ring, then mremap it to the target address.
+	 */
+	if (ring->sq_ring_addr && ring->sq_ring_size) {
+		/* Map the SQ ring from the new fd */
+		sq_ring_ptr = (void *)sys_mmap(NULL, ring->sq_ring_size,
+					       PROT_READ | PROT_WRITE,
+					       MAP_SHARED | MAP_POPULATE,
+					       fd, IORING_OFF_SQ_RING);
+		if (IS_ERR(sq_ring_ptr)) {
+			pr_err("Failed to mmap SQ ring: %ld\n", PTR_ERR(sq_ring_ptr));
+			sys_close(fd);
+			return -1;
+		}
+
+		/* Remap to target address */
+		ret = sys_mremap((unsigned long)sq_ring_ptr, ring->sq_ring_size,
+				 ring->sq_ring_size,
+				 MREMAP_FIXED | MREMAP_MAYMOVE,
+				 ring->sq_ring_addr);
+		if (ret != (long)ring->sq_ring_addr) {
+			pr_err("Failed to mremap SQ ring to 0x%lx: %ld\n",
+			       ring->sq_ring_addr, ret);
+			sys_close(fd);
+			return -1;
+		}
+		pr_debug("  SQ ring mapped at 0x%lx\n", ring->sq_ring_addr);
+	}
+
+	/* Map and remap SQEs */
+	if (ring->sqe_addr && ring->sqe_size) {
+		sqe_ptr = (void *)sys_mmap(NULL, ring->sqe_size,
+					   PROT_READ | PROT_WRITE,
+					   MAP_SHARED | MAP_POPULATE,
+					   fd, IORING_OFF_SQES);
+		if (IS_ERR(sqe_ptr)) {
+			pr_err("Failed to mmap SQEs: %ld\n", PTR_ERR(sqe_ptr));
+			sys_close(fd);
+			return -1;
+		}
+
+		ret = sys_mremap((unsigned long)sqe_ptr, ring->sqe_size,
+				 ring->sqe_size,
+				 MREMAP_FIXED | MREMAP_MAYMOVE,
+				 ring->sqe_addr);
+		if (ret != (long)ring->sqe_addr) {
+			pr_err("Failed to mremap SQEs to 0x%lx: %ld\n",
+			       ring->sqe_addr, ret);
+			sys_close(fd);
+			return -1;
+		}
+		pr_debug("  SQEs mapped at 0x%lx\n", ring->sqe_addr);
+	}
+
+	/*
+	 * Note: CQ ring is usually mapped together with SQ ring
+	 * at IORING_OFF_SQ_RING (offset 0). If they have separate
+	 * addresses, we'd need to handle that too.
+	 */
+
+	/* If the fd doesn't match, dup2 it to the expected fd */
+	if ((unsigned int)fd != ring->fd) {
+		ret = sys_dup2(fd, ring->fd);
+		if (ret < 0) {
+			pr_err("Failed to dup2 io_uring fd %d to %u: %ld\n",
+			       fd, ring->fd, ret);
+			sys_close(fd);
+			return -1;
+		}
+		sys_close(fd);
+		pr_debug("  Moved fd from %d to %u\n", fd, ring->fd);
+	}
+
+	pr_info("Restored io_uring ring at fd=%u\n", ring->fd);
+	return 0;
+}
+
 static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
 {
 	int aux, ret;
@@ -1982,6 +2142,13 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	for (i = 0; i < args->rings_n; i++)
 		if (restore_aio_ring(&args->rings[i]) < 0)
+			goto core_restore_end;
+
+	/*
+	 * Restore io_uring rings
+	 */
+	for (i = 0; i < args->io_uring_rings_n; i++)
+		if (restore_io_uring_ring(&args->io_uring_rings[i]) < 0)
 			goto core_restore_end;
 
 	/*
