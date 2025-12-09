@@ -1104,7 +1104,7 @@ struct io_uring_params_rst {
  */
 static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 {
-	struct io_uring_params_rst params;
+	struct io_uring_params_rst params = { 0 };
 	int fd;
 	long ret;
 	void *sq_ring_ptr, *sqe_ptr;
@@ -1112,8 +1112,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	pr_info("Restoring io_uring ring: fd=%u sq=%u cq=%u\n",
 		ring->fd, ring->sq_entries, ring->cq_entries);
 
-	/* Clear params and set up the ring configuration */
-	builtin_memset(&params, 0, sizeof(params));
+	/* Set up the ring configuration */
 	params.sq_entries = ring->sq_entries;
 	params.cq_entries = ring->cq_entries;
 	params.flags = ring->flags;

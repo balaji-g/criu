@@ -138,12 +138,15 @@ static int parse_io_uring_fdinfo(int proc_fd, int fd, struct io_uring_fdinfo *in
 	info->sq_thread_cpu = -1;
 
 	while (fgets(buf, sizeof(buf), f)) {
-		char *colon = strchr(buf, ':');
+		char *colon;
+		char *value;
+
+		colon = strchr(buf, ':');
 		if (!colon)
 			continue;
 
 		*colon = '\0';
-		char *value = colon + 1;
+		value = colon + 1;
 
 		/* Skip whitespace */
 		while (*value == ' ' || *value == '\t')
