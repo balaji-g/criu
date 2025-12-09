@@ -223,6 +223,7 @@ TST_NOFILE	:=				\
 		scm09				\
 		aio00				\
 		aio01				\
+		io_uring00			\
 		fd				\
 		fd01				\
 		apparmor				\
