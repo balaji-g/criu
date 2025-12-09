@@ -23,12 +23,17 @@
 | **Syscall** | `compel/.../syscall_64.tbl` | ✅ `sys_io_uring_setup` added |
 | Design doc | `docs/io_uring-design.md` | ✅ Complete |
 
+### ✅ Tests
+
+| Component | File | Status |
+|-----------|------|--------|
+| **ZDTM test** | `test/zdtm/static/io_uring00.c` | ✅ Basic io_uring C/R test |
+
 ### ❌ Not Yet Implemented
 
 | Component | File | Required Work |
 |-----------|------|---------------|
-| **ZDTM tests** | `test/zdtm/static/` | Add io_uring tests |
-| **Other arch syscalls** | `compel/arch/*/...` | Add io_uring_setup for arm64, s390, etc. |
+| **Other arch syscalls** | `compel/arch/*/...` | Add io_uring_setup for arm64, s390, ppc64, etc. |
 
 ## File Changes Summary
 
