@@ -33,6 +33,9 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "epoll: "
 
+/* Forward declaration for io_uring fd check used in epoll handling */
+static int is_io_uring_fd_epoll(pid_t pid, int fd);
+
 static LIST_HEAD(dinfo_list);
 
 typedef struct {
@@ -144,6 +147,16 @@ int flush_eventpoll_dinfo_queue(void)
 			};
 			struct kid_elem *t = kid_lookup_epoll_tfd(&fd_tree, &ke, &slot);
 			if (!t) {
+				/*
+				 * io_uring fds are not in fd_tree since they're handled
+				 * separately. Check if this is an io_uring fd and if so,
+				 * keep the original tfd value.
+				 */
+				if (is_io_uring_fd_epoll(dinfo->pid, tfde->tfd)) {
+					pr_debug("kid_lookup_epoll: tfd %d is io_uring, keeping original\n",
+						 tfde->tfd);
+					continue;  /* Skip to next tfd entry */
+				}
 				pr_debug("kid_lookup_epoll: no match pid %d efd %d tfd %d toff %u\n", dinfo->pid,
 					 dinfo->efd, tfde->tfd, dinfo->toff[i].off);
 				goto err;
@@ -213,6 +226,25 @@ static int toff_cmp_idx(const void *a, const void *b)
 }
 
 /*
+ * Check if an FD is an io_uring fd by reading /proc/pid/fd/N link.
+ * io_uring fds are skipped from the regular FD collection but may be
+ * referenced by epoll.
+ */
+static int is_io_uring_fd_epoll(pid_t pid, int fd)
+{
+	char path[64];
+	char link[64];
+	ssize_t len;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd);
+	len = readlink(path, link, sizeof(link) - 1);
+	if (len < 0)
+		return 0;
+	link[len] = '\0';
+	return strstr(link, "io_uring") != NULL;
+}
+
+/*
  * fds in fd_parms are sorted so we can use binary search
  * for better performance.
  */
@@ -244,6 +276,16 @@ static int find_tfd_bsearch(pid_t pid, int efd, int fds[], size_t nr_fds, int tf
 				 tfd, toff);
 			return tfd;
 		}
+	}
+
+	/*
+	 * io_uring fds are handled separately and not in the fds array.
+	 * If epoll references an io_uring fd, we return it as found since
+	 * it will be dumped/restored by io_uring code.
+	 */
+	if (is_io_uring_fd_epoll(pid, tfd)) {
+		pr_debug("find_tfd_bsearch: tfd %d is io_uring, accepting\n", tfd);
+		return tfd;
 	}
 
 	pr_debug("find_tfd_bsearch: no match pid %d efd %d tfd %d toff %u\n", pid, efd, tfd, toff);

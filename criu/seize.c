@@ -900,9 +900,21 @@ static int collect_threads(struct pstree_item *item)
 	for (i = 0; i < nr_threads; i++) {
 		pid_t pid = threads[i].real;
 		struct proc_status_creds t_creds = {};
+		char comm[32];
 
 		if (thread_collected(item, pid))
 			continue;
+
+		/*
+		 * Skip io_uring SQPOLL threads - they are kernel threads that
+		 * cannot be ptraced. They will be recreated when io_uring is
+		 * restored with IORING_SETUP_SQPOLL flag.
+		 */
+		task_comm_info(pid, comm, sizeof(comm));
+		if (strncmp(comm, "iou-sqp-", 8) == 0) {
+			pr_info("\tSkipping io_uring SQPOLL thread %d (%s)\n", pid, comm);
+			continue;
+		}
 
 		nr_inprogress++;
 

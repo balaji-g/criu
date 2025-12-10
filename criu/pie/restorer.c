@@ -1119,6 +1119,16 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	params.cq_entries = ring->cq_entries;
 	params.flags = ring->flags;
 
+	/* If SQPOLL was enabled, set the CPU affinity */
+	if (ring->sq_thread_cpu >= 0) {
+		params.sq_thread_cpu = ring->sq_thread_cpu;
+		pr_debug("  SQPOLL enabled: cpu=%d idle=%u\n",
+			 ring->sq_thread_cpu, ring->sq_thread_idle);
+	}
+	if (ring->sq_thread_idle > 0) {
+		params.sq_thread_idle = ring->sq_thread_idle;
+	}
+
 	/* Create a new io_uring instance */
 	fd = sys_io_uring_setup(ring->sq_entries, &params);
 	if (fd < 0) {

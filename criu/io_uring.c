@@ -369,7 +369,18 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		/* Ring configuration derived from masks */
 		entry->sq_entries = fdinfo.sq_mask + 1;
 		entry->cq_entries = fdinfo.cq_mask + 1;
-		entry->flags = 0; /* TODO: Get actual flags */
+
+		/*
+		 * Infer flags from ring state:
+		 * - If sq_thread is set (not -1), IORING_SETUP_SQPOLL was used
+		 */
+		entry->flags = 0;
+#define IORING_SETUP_SQPOLL (1U << 1)
+		if (fdinfo.sq_thread >= 0) {
+			entry->flags |= IORING_SETUP_SQPOLL;
+			pr_info("io_uring fd %d has SQPOLL enabled (thread=%d, cpu=%d)\n",
+				fd, fdinfo.sq_thread, fdinfo.sq_thread_cpu);
+		}
 
 		entry->sq_thread_cpu = fdinfo.sq_thread_cpu;
 		entry->has_sq_thread_cpu = true;
@@ -501,10 +512,12 @@ int prepare_io_urings(struct pstree_item *t, struct task_restore_args *ta)
 		ring->sq_entries = e->sq_entries;
 		ring->cq_entries = e->cq_entries;
 		ring->flags = e->flags;
+		ring->sq_thread_cpu = e->has_sq_thread_cpu ? e->sq_thread_cpu : -1;
+		ring->sq_thread_idle = e->has_sq_thread_idle ? e->sq_thread_idle : 0;
 		ring->fd = e->id;
 
-		pr_info("  Ring %d: fd=%u sq=%u cq=%u sq_addr=0x%lx cq_addr=0x%lx sqe_addr=0x%lx\n",
-			i, ring->fd, ring->sq_entries, ring->cq_entries,
+		pr_info("  Ring %d: fd=%u sq=%u cq=%u flags=0x%x sq_addr=0x%lx cq_addr=0x%lx sqe_addr=0x%lx\n",
+			i, ring->fd, ring->sq_entries, ring->cq_entries, ring->flags,
 			ring->sq_ring_addr, ring->cq_ring_addr, ring->sqe_addr);
 	}
 

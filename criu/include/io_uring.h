@@ -37,6 +37,10 @@ struct rst_io_uring_ring {
 	unsigned int cq_entries;
 	unsigned int flags;
 	
+	/* SQPOLL configuration */
+	int sq_thread_cpu;  /* CPU for SQPOLL thread (-1 for any) */
+	unsigned int sq_thread_idle; /* Idle timeout in ms */
+	
 	/* Target fd (what the app expects) */
 	unsigned int fd;
 };
