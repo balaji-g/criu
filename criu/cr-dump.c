@@ -234,12 +234,32 @@ static int check_thread_rseq(pid_t tid, const struct parasite_check_rseq *ti_rse
 
 struct cr_imgset *glob_imgset;
 
+/*
+ * Check if an FD is an io_uring fd by reading /proc/pid/fd/N link.
+ * io_uring fds cannot be sent via SCM_RIGHTS, so we skip them here
+ * and handle them separately via the io_uring dump code.
+ */
+static int is_io_uring_fd(pid_t pid, int fd)
+{
+	char path[64], link[256];
+	int ret;
+
+	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd);
+	ret = readlink(path, link, sizeof(link) - 1);
+	if (ret < 0)
+		return 0;
+	link[ret] = '\0';
+
+	return strstr(link, "io_uring") != NULL;
+}
+
 static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 {
 	struct dirent *de;
 	DIR *fd_dir;
 	int size = 0;
 	int n;
+	int skipped_iouring = 0;
 
 	pr_info("\n");
 	pr_info("Collecting fds (pid: %d)\n", pid);
@@ -251,8 +271,22 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 
 	n = 0;
 	while ((de = readdir(fd_dir))) {
+		int fd;
+
 		if (dir_dots(de))
 			continue;
+
+		fd = atoi(de->d_name);
+
+		/*
+		 * Skip io_uring fds - they cannot be sent via SCM_RIGHTS
+		 * and are handled separately by io_uring dump code.
+		 */
+		if (is_io_uring_fd(pid, fd)) {
+			pr_debug("Skipping io_uring fd %d (handled separately)\n", fd);
+			skipped_iouring++;
+			continue;
+		}
 
 		if (sizeof(struct parasite_drain_fd) + sizeof(int) * (n + 1) > size) {
 			struct parasite_drain_fd *t;
@@ -266,11 +300,11 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 			*dfds = t;
 		}
 
-		(*dfds)->fds[n++] = atoi(de->d_name);
+		(*dfds)->fds[n++] = fd;
 	}
 
 	(*dfds)->nr_fds = n;
-	pr_info("Found %d file descriptors\n", n);
+	pr_info("Found %d file descriptors (%d io_uring skipped)\n", n, skipped_iouring);
 	pr_info("----------------------------------------\n");
 
 	closedir(fd_dir);

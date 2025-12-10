@@ -439,6 +439,19 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
 	if (prev_vfi->vma && vfi_equal(vfi, prev_vfi)) {
 		struct vma_area *prev = prev_vfi->vma;
 
+		pr_debug("vma %" PRIx64 " borrows vfi from previous %" PRIx64 "\n", vma->e->start, prev->e->start);
+
+		/*
+		 * io_uring VMAs close their fd after identification, so inherit
+		 * the status even when vm_file_fd is negative.
+		 */
+		if (prev->e->status & VMA_AREA_IOURING) {
+			vma->e->status = VMA_AREA_IOURING;
+			vma->vm_iouring_ino = prev->vm_iouring_ino;
+			vma->file_borrowed = true;
+			return 0;
+		}
+
 		/*
 		 * If vfi is equal (!) and negative @vm_file_fd --
 		 * we have nothing to borrow for sure.
@@ -446,7 +459,6 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
 		if (*vm_file_fd < 0)
 			return 0;
 
-		pr_debug("vma %" PRIx64 " borrows vfi from previous %" PRIx64 "\n", vma->e->start, prev->e->start);
 		if (prev->e->status & VMA_AREA_SOCKET)
 			vma->e->status |= VMA_AREA_SOCKET | VMA_AREA_REGULAR;
 

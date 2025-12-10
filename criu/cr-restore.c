@@ -3325,6 +3325,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	RST_MEM_FIXUP_PPTR(task_args->vmas);
 	RST_MEM_FIXUP_PPTR(task_args->rings);
+	RST_MEM_FIXUP_PPTR(task_args->io_uring_rings);
 	RST_MEM_FIXUP_PPTR(task_args->tcp_socks);
 	RST_MEM_FIXUP_PPTR(task_args->timerfd);
 	RST_MEM_FIXUP_PPTR(task_args->posix_timers);

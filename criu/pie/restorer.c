@@ -1109,8 +1109,10 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	long ret;
 	void *sq_ring_ptr, *sqe_ptr;
 
-	pr_info("Restoring io_uring ring: fd=%u sq=%u cq=%u\n",
-		ring->fd, ring->sq_entries, ring->cq_entries);
+	pr_info("Restoring io_uring ring: fd=%u sq=%u cq=%u sq_addr=0x%lx sq_size=%lu sqe_addr=0x%lx sqe_size=%lu\n",
+		ring->fd, ring->sq_entries, ring->cq_entries,
+		ring->sq_ring_addr, ring->sq_ring_size,
+		ring->sqe_addr, ring->sqe_size);
 
 	/* Set up the ring configuration */
 	params.sq_entries = ring->sq_entries;
@@ -1127,61 +1129,74 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	pr_debug("  Created io_uring fd=%d (wanted %u)\n", fd, ring->fd);
 
 	/*
-	 * Map the SQ/CQ rings at the target address
-	 * The kernel creates them at an arbitrary address, we need to
-	 * remap them to where the app expects them.
-	 *
-	 * First, we mmap the new ring, then mremap it to the target address.
+	 * Map the SQ/CQ rings.
+	 * The target address range was already unmapped by VMA restore (skipped io_uring VMAs).
+	 * Use PAGE_SIZE as minimum since io_uring ring size is typically < 4KB.
 	 */
-	if (ring->sq_ring_addr && ring->sq_ring_size) {
-		/* Map the SQ ring from the new fd */
-		sq_ring_ptr = (void *)sys_mmap(NULL, ring->sq_ring_size,
+	if (ring->sq_ring_addr) {
+		/* Use at least PAGE_SIZE, rounded up from checkpoint size */
+		long actual_size = ring->sq_ring_size > 0 ? ring->sq_ring_size : 4096;
+		if (actual_size < 4096) actual_size = 4096;
+
+		pr_debug("  Mapping SQ ring at 0x%lx (size=%ld, checkpointed=%lu)\n",
+			 ring->sq_ring_addr, actual_size, ring->sq_ring_size);
+
+		/* Map at target address */
+		sq_ring_ptr = (void *)sys_mmap((void *)ring->sq_ring_addr, actual_size,
 					       PROT_READ | PROT_WRITE,
-					       MAP_SHARED | MAP_POPULATE,
+					       MAP_SHARED | MAP_FIXED,
 					       fd, IORING_OFF_SQ_RING);
 		if (IS_ERR(sq_ring_ptr)) {
-			pr_err("Failed to mmap SQ ring: %ld\n", PTR_ERR(sq_ring_ptr));
-			sys_close(fd);
-			return -1;
+			pr_err("Failed to mmap SQ ring at 0x%lx (size=%ld): %ld\n",
+			       ring->sq_ring_addr, actual_size, PTR_ERR(sq_ring_ptr));
+			/* Try without MAP_FIXED as fallback */
+			sq_ring_ptr = (void *)sys_mmap(NULL, actual_size,
+						       PROT_READ | PROT_WRITE,
+						       MAP_SHARED | MAP_POPULATE,
+						       fd, IORING_OFF_SQ_RING);
+			if (IS_ERR(sq_ring_ptr)) {
+				pr_err("Failed to mmap SQ ring anywhere: %ld\n", PTR_ERR(sq_ring_ptr));
+				sys_close(fd);
+				return -1;
+			}
+			pr_warn("  SQ ring mapped at 0x%lx instead of 0x%lx (app may crash)\n",
+				(unsigned long)sq_ring_ptr, ring->sq_ring_addr);
+		} else {
+			pr_debug("  SQ ring mapped at 0x%lx\n", (unsigned long)sq_ring_ptr);
 		}
-
-		/* Remap to target address */
-		ret = sys_mremap((unsigned long)sq_ring_ptr, ring->sq_ring_size,
-				 ring->sq_ring_size,
-				 MREMAP_FIXED | MREMAP_MAYMOVE,
-				 ring->sq_ring_addr);
-		if (ret != (long)ring->sq_ring_addr) {
-			pr_err("Failed to mremap SQ ring to 0x%lx: %ld\n",
-			       ring->sq_ring_addr, ret);
-			sys_close(fd);
-			return -1;
-		}
-		pr_debug("  SQ ring mapped at 0x%lx\n", ring->sq_ring_addr);
 	}
 
-	/* Map and remap SQEs */
-	if (ring->sqe_addr && ring->sqe_size) {
-		sqe_ptr = (void *)sys_mmap(NULL, ring->sqe_size,
+	/* Map SQEs at the target address */
+	if (ring->sqe_addr) {
+		long sqe_actual_size = ring->sqe_size > 0 ? ring->sqe_size : (ring->sq_entries * 64);
+		if (sqe_actual_size < 4096) sqe_actual_size = 4096;
+
+		pr_debug("  Mapping SQEs at 0x%lx (size=%ld, checkpointed=%lu)\n",
+			 ring->sqe_addr, sqe_actual_size, ring->sqe_size);
+
+		/* Map at target address */
+		sqe_ptr = (void *)sys_mmap((void *)ring->sqe_addr, sqe_actual_size,
 					   PROT_READ | PROT_WRITE,
-					   MAP_SHARED | MAP_POPULATE,
+					   MAP_SHARED | MAP_FIXED,
 					   fd, IORING_OFF_SQES);
 		if (IS_ERR(sqe_ptr)) {
-			pr_err("Failed to mmap SQEs: %ld\n", PTR_ERR(sqe_ptr));
-			sys_close(fd);
-			return -1;
+			pr_err("Failed to mmap SQEs at 0x%lx (size=%ld): %ld\n",
+			       ring->sqe_addr, sqe_actual_size, PTR_ERR(sqe_ptr));
+			/* Try without MAP_FIXED as fallback */
+			sqe_ptr = (void *)sys_mmap(NULL, sqe_actual_size,
+						   PROT_READ | PROT_WRITE,
+						   MAP_SHARED | MAP_POPULATE,
+						   fd, IORING_OFF_SQES);
+			if (IS_ERR(sqe_ptr)) {
+				pr_err("Failed to mmap SQEs anywhere: %ld\n", PTR_ERR(sqe_ptr));
+				sys_close(fd);
+				return -1;
+			}
+			pr_warn("  SQEs mapped at 0x%lx instead of 0x%lx (app may crash)\n",
+				(unsigned long)sqe_ptr, ring->sqe_addr);
+		} else {
+			pr_debug("  SQEs mapped at 0x%lx\n", (unsigned long)sqe_ptr);
 		}
-
-		ret = sys_mremap((unsigned long)sqe_ptr, ring->sqe_size,
-				 ring->sqe_size,
-				 MREMAP_FIXED | MREMAP_MAYMOVE,
-				 ring->sqe_addr);
-		if (ret != (long)ring->sqe_addr) {
-			pr_err("Failed to mremap SQEs to 0x%lx: %ld\n",
-			       ring->sqe_addr, ret);
-			sys_close(fd);
-			return -1;
-		}
-		pr_debug("  SQEs mapped at 0x%lx\n", ring->sqe_addr);
 	}
 
 	/*
