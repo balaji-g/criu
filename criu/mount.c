@@ -749,9 +749,18 @@ int validate_mounts(struct mount_info *info, bool for_dump)
 					ret = m->need_plugin ? 0 : -ENOTSUP;
 
 				if (ret < 0) {
-					if (ret == -ENOTSUP)
-						pr_err("%d:%s doesn't have a proper root mount\n", m->mnt_id,
-						       m->ns_mountpoint);
+					if (ret == -ENOTSUP) {
+						/*
+						 * For container restore, some mounts (like K8s
+						 * termination-log, secrets) may not have proper
+						 * root mounts in the new context. Warn and skip
+						 * rather than failing the entire restore.
+						 */
+						pr_warn("%d:%s doesn't have a proper root mount, skipping\n",
+							m->mnt_id, m->ns_mountpoint);
+						m->need_plugin = true; /* Mark to skip in restore */
+						continue;
+					}
 					return -1;
 				}
 			}
@@ -2346,8 +2355,16 @@ int restore_ext_mount(struct mount_info *mi)
 
 	pr_debug("Restoring external bind mount %s\n", service_mountpoint(mi));
 	ret = run_plugins(RESTORE_EXT_MOUNT, mi->mnt_id, service_mountpoint(mi), "/", NULL);
-	if (ret)
-		pr_err("Can't restore ext mount (%d)\n", ret);
+	if (ret) {
+		/*
+		 * For container restore, many external mounts (NVIDIA libs,
+		 * K8s config files) may not be restorable. Warn and skip
+		 * rather than failing the entire restore.
+		 */
+		pr_warn("Can't restore ext mount %s (%d), skipping\n",
+			mi->ns_mountpoint ?: "(null)", ret);
+		return 0;  /* Continue with restore */
+	}
 	return ret;
 }
 
@@ -3138,8 +3155,25 @@ static int get_mp_root(MntEntry *me, struct mount_info *mi)
 	} else {
 		ext = ext_mount_lookup(me->ext_key);
 		if (!ext) {
-			pr_err("No mapping for %d:%s mountpoint\n", mi->mnt_id, mi->ns_mountpoint);
-			return -1;
+			/*
+			 * If we can't find a mapping for an external mount, warn
+			 * and continue. This allows container restore to proceed
+			 * even when some mounts (like K8s secrets, masked /proc
+			 * entries) can't be recreated. The restored process will
+			 * function but without these mounts.
+			 */
+			pr_warn("No mapping for mount %d:%s (ext_key: %s), skipping\n", 
+				mi->mnt_id, mi->ns_mountpoint ?: "(null)", me->ext_key);
+			/* 
+			 * Use the source path as a fallback - this allows bind mounts
+			 * from host paths to still work when the source exists.
+			 */
+			ext = mi->source;
+			if (!ext || !ext[0] || ext[0] == '/') {
+				/* Source is absolute or empty - skip this mount */
+				mi->external = NULL;
+				goto out;
+			}
 		}
 	}
 

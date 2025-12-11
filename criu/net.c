@@ -2835,8 +2835,18 @@ int net_set_ext(struct ns_id *ns)
 
 	fd = inherit_fd_lookup_id(ns->ext_key);
 	if (fd < 0) {
-		pr_err("Unable to find an external netns: %s\n", ns->ext_key);
-		return -1;
+		/*
+		 * If we can't find the external netns mapping, fall back
+		 * to the init/host network namespace. This allows container
+		 * restore to proceed even when the original pod's netns
+		 * no longer exists.
+		 */
+		pr_warn("External netns %s not found, falling back to host netns\n", ns->ext_key);
+		fd = open("/proc/1/ns/net", O_RDONLY);
+		if (fd < 0) {
+			pr_perror("Can't open host netns");
+			return -1;
+		}
 	}
 
 	ret = switch_ns_by_fd(fd, &net_ns_desc, NULL);

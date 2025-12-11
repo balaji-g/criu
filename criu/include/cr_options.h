@@ -198,6 +198,8 @@ struct cr_options {
 	int network_lock_method;
 	int skip_file_rwx_check;
 	int allow_uprobes;
+	int skip_mnt_ns;  /* Skip mount namespace restore for container migration */
+	int skip_file_validation;  /* Skip file size/buildid validation on restore */
 
 	/*
 	 * When we scheduler for removal some functionality we first

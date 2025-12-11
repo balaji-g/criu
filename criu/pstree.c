@@ -955,6 +955,16 @@ static int prepare_pstree_kobj_ids(void)
 		if (item == root_item) {
 			pr_info("Will restore in %lx namespaces\n", cflags);
 			root_ns_mask = cflags;
+			/*
+			 * If --skip-mnt-ns is set, clear CLONE_NEWNS to skip
+			 * mount namespace restoration. This is useful for
+			 * container migration where the target container
+			 * already has its mount namespace set up.
+			 */
+			if (opts.skip_mnt_ns) {
+				pr_info("Skipping mount namespace restore (--skip-mnt-ns)\n");
+				root_ns_mask &= ~CLONE_NEWNS;
+			}
 		} else if (cflags & ~(root_ns_mask & CLONE_SUBNS)) {
 			/*
 			 * Namespaces from CLONE_SUBNS can be nested, but in

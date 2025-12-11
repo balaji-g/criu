@@ -2171,6 +2171,12 @@ static bool validate_file(const int fd, const struct stat *fd_status, const stru
 {
 	int result = 1;
 
+	/* Skip all validation if --skip-file-validation is set */
+	if (opts.skip_file_validation) {
+		pr_info("Skipping file validation for %s (--skip-file-validation)\n", rfi->path);
+		return true;
+	}
+
 	if (rfi->rfe->has_size && (fd_status->st_size != rfi->rfe->size)) {
 		pr_err("File %s has bad size %" PRIu64 " (expect %" PRIu64 ")\n", rfi->path, fd_status->st_size,
 		       rfi->rfe->size);

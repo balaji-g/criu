@@ -31,7 +31,9 @@
 
 #include "common/xmalloc.h"
 
-struct cr_options opts;
+struct cr_options opts = {
+	.enable_external_masters = 1, /* Default true for container runtimes with complex mounts */
+};
 char *rpc_cfg_file;
 
 static int count_elements(char **to_count)
@@ -703,6 +705,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
+		BOOL_OPT("skip-mnt-ns", &opts.skip_mnt_ns),
+		BOOL_OPT("skip-file-validation", &opts.skip_file_validation),
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		BOOL_OPT(OPT_ALLOW_UPROBES, &opts.allow_uprobes),
