@@ -3882,10 +3882,15 @@ int __mntns_get_root_fd(pid_t pid)
 		 * All paths resolution would occur relative to criu's
 		 * root. Even if it is not namespace's root, provided
 		 * file paths are resolved, we'd get consistent dump.
+		 *
+		 * When --skip-mnt-ns is used with --root, use the specified
+		 * root for path resolution. This enables container migration
+		 * where we restore into an existing container's rootfs.
 		 */
-		fd = open("/", O_RDONLY | O_DIRECTORY);
+		const char *root_path = (opts.skip_mnt_ns && opts.root) ? opts.root : "/";
+		fd = open(root_path, O_RDONLY | O_DIRECTORY);
 		if (fd < 0) {
-			pr_perror("Can't open root");
+			pr_perror("Can't open root %s", root_path);
 			return -1;
 		}
 

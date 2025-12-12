@@ -13,6 +13,7 @@
 
 #include "types.h"
 #include "crtools.h"
+#include "cr_options.h"
 #include "common/compiler.h"
 #include "imgset.h"
 #include "rst_info.h"
@@ -456,6 +457,17 @@ static int eventpoll_retore_tfd(int fd, int id, EventpollTfdEntry *tdefe)
 	event.events = tdefe->events;
 	event.data.u64 = tdefe->data;
 	if (epoll_ctl(fd, EPOLL_CTL_ADD, tdefe->tfd, &event)) {
+		/*
+		 * When using --skip-mnt-ns for container migration,
+		 * some fds (like sockets) may have been removed from
+		 * the checkpoint. Skip epoll errors for these cases -
+		 * the application will recreate watchers as needed.
+		 */
+		if (opts.skip_mnt_ns) {
+			pr_warn("Skipping epoll event on %#08x tfd %d (--skip-mnt-ns)\n",
+				id, tdefe->tfd);
+			return 0;
+		}
 		pr_perror("Can't add event on %#08x", id);
 		return -1;
 	}

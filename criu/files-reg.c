@@ -2261,6 +2261,21 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 				goto err;
 			}
 		} else if (ret < 0) {
+			/*
+			 * When using --skip-mnt-ns for container migration,
+			 * ghost files in /dev/shm (POSIX semaphores) and /dev/
+			 * cannot be created in the new container's mount namespace.
+			 * These are runtime objects - warn and continue.
+			 */
+			if (opts.skip_mnt_ns && strstr(rfi->path, "dev/shm/")) {
+				pr_warn("Skipping ghost file %s - runtime object (--skip-mnt-ns)\n", rfi->path);
+				mutex_unlock(remap_open_lock);
+				/*
+				 * Return special fd -1 to indicate skip.
+				 * Caller must handle this appropriately.
+				 */
+				return -1;
+			}
 			pr_perror("Can't link %s -> %s", rfi->remap->rpath, rfi->path);
 			goto err;
 		}
@@ -2356,6 +2371,20 @@ int do_open_reg_noseek_flags(int ns_root_fd, struct reg_file_info *rfi, void *ar
 
 	fd = openat(ns_root_fd, rfi->path, flags);
 	if (fd < 0) {
+		/*
+		 * When using --skip-mnt-ns with --root, device files like
+		 * /dev/null are not in the overlay rootfs but bind-mounted
+		 * by the container runtime. Try opening from host /dev.
+		 */
+		if (opts.skip_mnt_ns && strncmp(rfi->path, "dev/", 4) == 0) {
+			char host_path[PATH_MAX];
+			snprintf(host_path, sizeof(host_path), "/%s", rfi->path);
+			fd = open(host_path, flags);
+			if (fd >= 0) {
+				pr_info("Opened %s from host instead of rootfs\n", host_path);
+				return fd;
+			}
+		}
 		pr_perror("Can't open file %s on restore", rfi->path);
 		return fd;
 	}
