@@ -466,6 +466,12 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	TcpOptsEntry tcpopts = TCP_OPTS_ENTRY__INIT;
 	int ret = -1, err = -1, proto, aux, type;
 
+	/* Skip inet sockets for portable checkpoints */
+	if (opts.skip_inet_sockets || opts.portable) {
+		pr_info("Skipping inet socket fd %d (--skip-inet-sockets/--portable)\n", lfd);
+		return 0;
+	}
+
 	ret = do_dump_opt(lfd, SOL_SOCKET, SO_PROTOCOL, &proto, sizeof(proto));
 	if (ret)
 		goto err;

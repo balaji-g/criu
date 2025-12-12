@@ -332,6 +332,12 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 	FownEntry *fown;
 	void *m;
 
+	/* Skip unix sockets for portable checkpoints */
+	if (opts.skip_unix_sockets || opts.portable) {
+		pr_info("Skipping unix socket fd %d (--skip-unix-sockets/--portable)\n", lfd);
+		return 0;
+	}
+
 	m = xmalloc(sizeof(UnixSkEntry) + sizeof(SkOptsEntry) + sizeof(FilePermsEntry) + sizeof(FownEntry));
 	if (!m)
 		return -ENOMEM;
