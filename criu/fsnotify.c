@@ -281,6 +281,11 @@ fault:
 	pr_warn("\tHandle 0x%x:0x%lx cannot be opened\n", s_dev, i_ino);
 	irmap_path = irmap_lookup(s_dev, i_ino);
 	if (!irmap_path) {
+		/* Skip unresolvable handles when --skip-fsnotify is set (containers/K8s) */
+		if (opts.skip_fsnotify) {
+			pr_warn("\tSkipping unresolvable fsnotify handle (--skip-fsnotify)\n");
+			goto out_nopath;
+		}
 		pr_err("\tCan't dump that handle\n");
 		return -1;
 	}
@@ -317,6 +322,29 @@ static int dump_one_inotify(int lfd, u32 id, const struct fd_parms *p)
 	FileEntry fe = FILE_ENTRY__INIT;
 	InotifyFileEntry ie = INOTIFY_FILE_ENTRY__INIT;
 	int exit_code = -1, i, ret;
+
+	/* 
+	 * When --skip-fsnotify is set, write a minimal valid inotify entry
+	 * with no watches. This allows restore to create an empty inotify fd
+	 * rather than failing due to missing file entry.
+	 * Used for containers/K8s where fsnotify is non-essential.
+	 */
+	if (opts.skip_fsnotify) {
+		pr_warn("Skipping inotify %#08x content, writing stub entry (--skip-fsnotify)\n", id);
+		ie.id = id;
+		ie.flags = p->flags;
+		ie.fown = (FownEntry *)&p->fown;
+		ie.n_wd = 0;  /* No watches - empty inotify */
+		ie.wd = NULL;
+
+		fe.type = FD_TYPES__INOTIFY;
+		fe.id = ie.id;
+		fe.ify = &ie;
+
+		if (pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE))
+			return -1;
+		return 0;
+	}
 
 	ret = fd_has_data(lfd);
 	if (ret < 0)
@@ -418,6 +446,31 @@ static int dump_one_fanotify(int lfd, u32 id, const struct fd_parms *p)
 	FileEntry fle = FILE_ENTRY__INIT;
 	FanotifyFileEntry fe = FANOTIFY_FILE_ENTRY__INIT;
 	int ret = -1, i;
+
+	/*
+	 * When --skip-fsnotify is set, write a minimal valid fanotify entry
+	 * with no marks. This allows restore to create an empty fanotify fd
+	 * rather than failing due to missing file entry.
+	 * Used for containers/K8s where fsnotify is non-essential.
+	 */
+	if (opts.skip_fsnotify) {
+		pr_warn("Skipping fanotify %#08x content, writing stub entry (--skip-fsnotify)\n", id);
+		fe.id = id;
+		fe.flags = p->flags;
+		fe.fown = (FownEntry *)&p->fown;
+		fe.n_mark = 0;  /* No marks - empty fanotify */
+		fe.mark = NULL;
+		fe.faflags = 0;
+		fe.evflags = 0;
+
+		fle.type = FD_TYPES__FANOTIFY;
+		fle.id = fe.id;
+		fle.ffy = &fe;
+
+		if (pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fle, PB_FILE))
+			return -1;
+		return 0;
+	}
 
 	ret = fd_has_data(lfd);
 	if (ret < 0)

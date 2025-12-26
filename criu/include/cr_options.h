@@ -168,6 +168,7 @@ struct cr_options {
 	int auto_dedup;
 	unsigned int cpu_cap;
 	int force_irmap;
+	int skip_fsnotify;
 	char **exec_cmd;
 	unsigned int manage_cgroups;
 	char *new_global_cg_root;
