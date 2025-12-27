@@ -207,7 +207,9 @@ static int cuda_checkpoint_supports_flag(const char *flag)
 	return 1;
 }
 
-/* Retrieve the cuda restore thread TID from the root pid */
+/* Retrieve the cuda restore thread TID from the root pid.
+ * Returns -1 if the process has no CUDA context (not an error condition).
+ */
 static int get_cuda_restore_tid(int root_pid)
 {
 	char pid_buf[16];
@@ -218,6 +220,16 @@ static int get_cuda_restore_tid(int root_pid)
 	const char *args[] = { CUDA_CHECKPOINT, "--get-restore-tid", "--pid", pid_buf, NULL };
 	int ret = launch_cuda_checkpoint(args, pid_out, sizeof(pid_out));
 	if (ret != 0) {
+		/* "Could not find restore thread" means no CUDA context - this is OK, not an error.
+		 * This commonly happens for helper processes like Python's multiprocessing.resource_tracker
+		 * which are part of the process tree but have no GPU context.
+		 */
+		if (strstr(pid_out, "Could not find restore thread") != NULL ||
+		    strstr(pid_out, "not supported") != NULL ||
+		    strstr(pid_out, "no CUDA") != NULL) {
+			pr_debug("pid %d has no CUDA context (restore tid not found), skipping\n", root_pid);
+			return -1;
+		}
 		pr_err("Failed to launch cuda-checkpoint to retrieve restore tid: %s\n", pid_out);
 		return -1;
 	}
@@ -249,6 +261,13 @@ static cuda_task_state_t get_cuda_state(pid_t pid)
 	snprintf(pid_buf, sizeof(pid_buf), "%d", pid);
 
 	if (launch_cuda_checkpoint(args, state_str, sizeof(state_str))) {
+		/* Non-CUDA processes will fail here - treat as "no context" not error */
+		if (strstr(state_str, "not supported") != NULL ||
+		    strstr(state_str, "Could not") != NULL ||
+		    strstr(state_str, "no CUDA") != NULL) {
+			pr_debug("pid %d has no CUDA context (get-state failed), skipping\n", pid);
+			return CUDA_TASK_UNKNOWN;
+		}
 		pr_err("Failed to launch cuda-checkpoint to retrieve state: %s\n", state_str);
 		return CUDA_TASK_UNKNOWN;
 	}
@@ -415,14 +434,15 @@ int cuda_plugin_pause_devices(int pid)
 	restore_tid = get_cuda_restore_tid(pid);
 
 	if (restore_tid == -1) {
-		pr_info("no need to pause devices on pid %d\n", pid);
+		pr_debug("no need to pause devices on pid %d (no CUDA context)\n", pid);
 		return 0;
 	}
 
 	task_state = get_cuda_state(restore_tid);
 	if (task_state == CUDA_TASK_UNKNOWN) {
-		pr_err("Failed to get CUDA state for PID %d\n", restore_tid);
-		return -1;
+		/* Process has no valid CUDA state - skip it (not an error) */
+		pr_debug("skipping pid %d: no valid CUDA state\n", pid);
+		return 0;
 	}
 
 	if (!plugin_added_to_inventory) {
