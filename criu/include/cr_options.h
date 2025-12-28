@@ -202,6 +202,7 @@ struct cr_options {
 	int skip_file_validation;  /* Skip file size/buildid validation on restore */
 	int skip_inet_sockets;  /* Skip inet sockets during dump for portable checkpoints */
 	int skip_unix_sockets;  /* Skip unix sockets during dump */
+	int skip_lsm;  /* Skip LSM (AppArmor/SELinux) profile restoration */
 	int portable;  /* Portable checkpoint mode: skip sockets, temp files for cross-node migration */
 
 	/*

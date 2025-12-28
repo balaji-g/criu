@@ -348,6 +348,11 @@ extern Lsmtype image_lsm;
 
 int validate_lsm(char *lsm_profile)
 {
+	if (opts.skip_lsm) {
+		pr_warn("Skipping LSM profile restore (--skip-lsm)\n");
+		return 0;
+	}
+
 	if (image_lsm == LSMTYPE__NO_LSM || image_lsm == kdat.lsm)
 		return 0;
 
@@ -367,6 +372,12 @@ int validate_lsm(char *lsm_profile)
 int render_lsm_profile(char *profile, char **val)
 {
 	*val = NULL;
+
+	/* Skip LSM profile rendering when --skip-lsm is set */
+	if (opts.skip_lsm) {
+		pr_warn("Skipping LSM profile rendering (--skip-lsm)\n");
+		return 0;
+	}
 
 	switch (kdat.lsm) {
 	case LSMTYPE__APPARMOR:
