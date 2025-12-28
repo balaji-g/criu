@@ -372,6 +372,15 @@ int cuda_plugin_checkpoint_devices(int pid)
 		return -ENOTSUP;
 	}
 
+	/*
+	 * Skip cuda-checkpoint call - it hangs on some workloads (vLLM).
+	 * The DUMP_EXT_FILE hook handles NVIDIA device FDs, and
+	 * HANDLE_DEVICE_VMA handles GPU memory mappings.
+	 * CUDA will reinitialize on restore.
+	 */
+	pr_info("Skipping cuda-checkpoint for pid %d (NVCRYO mode)\n", pid);
+	return 0;
+
 	restore_tid = get_cuda_restore_tid(pid);
 
 	/* We can possibly hit a race with cuInit() where we are past the point of
@@ -630,6 +639,54 @@ int cuda_plugin_update_vma_map(const char *path, const uint64_t addr,
 	return 1; /* Tell CRIU to use our fd */
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, cuda_plugin_update_vma_map)
+
+/**
+ * Handle NVIDIA device file descriptors during dump.
+ * NVIDIA device FDs cannot be dumped normally - they are kernel resources
+ * tied to GPU context. We tell CRIU to skip them.
+ * cuda-checkpoint will restore the GPU context on restore.
+ *
+ * NVIDIA device majors:
+ * - 195: nvidia (nvidiactl, nvidia0-N)
+ * - 235: nvidia-uvm
+ * - 509: nvidia-nvswitch
+ * - 510: nvidia-caps
+ * - 511: nvidia-caps-imex-channels
+ */
+static bool is_nvidia_device_major(unsigned int maj)
+{
+	switch (maj) {
+	case 195:  /* nvidia */
+	case 235:  /* nvidia-uvm */
+	case 509:  /* nvidia-nvswitch */
+	case 510:  /* nvidia-caps */
+	case 511:  /* nvidia-caps-imex-channels */
+		return true;
+	default:
+		return false;
+	}
+}
+
+int cuda_plugin_dump_file(int fd, int id)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) == -1) {
+		return -ENOTSUP; /* Can't stat, not our file */
+	}
+
+	/* Check if this is a character device with an NVIDIA major */
+	if (!S_ISCHR(st.st_mode) || !is_nvidia_device_major(major(st.st_rdev))) {
+		return -ENOTSUP; /* Not an NVIDIA device */
+	}
+
+	pr_info("CUDA plugin: skipping NVIDIA device fd %d (major %d, minor %d) - will be restored by cuda-checkpoint\n",
+		fd, major(st.st_rdev), minor(st.st_rdev));
+
+	/* Return 0 to tell CRIU we handled this file (skip dumping it) */
+	return 0;
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__DUMP_EXT_FILE, cuda_plugin_dump_file)
 
 /**
  * Check if a CUDA device is available on the system
