@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sys/sysmacros.h>
+#include <sys/stat.h>
 
 /* cuda-checkpoint binary should live in your PATH */
 #define CUDA_CHECKPOINT "cuda-checkpoint"
@@ -562,6 +564,72 @@ int cuda_plugin_resume_devices_late(int pid)
 	return resume_device(pid, 1, CUDA_TASK_RUNNING);
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_devices_late)
+
+/**
+ * Handle NVIDIA device VMAs during dump.
+ * This hook is called when CRIU encounters a device file mmap.
+ * Returning 0 tells CRIU that this plugin will handle the VMA.
+ */
+int cuda_plugin_handle_device_vma(int fd, const struct stat *st_buf)
+{
+	/* NVIDIA device major numbers:
+	 * 195 = nvidia (nvidia0, nvidiactl, nvidia-modeset)
+	 * 506 = nvidia-uvm (nvidia-uvm, nvidia-uvm-tools)
+	 */
+	unsigned int major_num = major(st_buf->st_rdev);
+
+	if (major_num == 195 || major_num == 506) {
+		pr_info("CUDA plugin handling NVIDIA device VMA (major %d, minor %d)\n",
+			major_num, minor(st_buf->st_rdev));
+
+		if (!plugin_added_to_inventory) {
+			if (add_inventory_plugin(CR_PLUGIN_DESC.name)) {
+				pr_err("Failed to add CUDA plugin to inventory\n");
+				return -1;
+			}
+			plugin_added_to_inventory = true;
+		}
+
+		return 0; /* Plugin will handle this VMA */
+	}
+
+	return -ENOTSUP; /* Not our device, let other plugins try */
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA, cuda_plugin_handle_device_vma)
+
+/**
+ * Update VMA mapping during restore.
+ * For NVIDIA device VMAs, we return a /dev/zero mapping instead of the real device.
+ * cuda-checkpoint will restore the actual GPU state after CRIU restore completes.
+ */
+int cuda_plugin_update_vma_map(const char *path, const uint64_t addr,
+			       const uint64_t old_pgoff, uint64_t *new_pgoff, int *plugin_fd)
+{
+	static int devzero_fd = -1;
+
+	/* Check if this is an NVIDIA device path */
+	if (strstr(path, "/dev/nvidia") == NULL && strstr(path, "nvidia-uvm") == NULL) {
+		return -ENOTSUP; /* Not our device */
+	}
+
+	pr_info("CUDA plugin: mapping NVIDIA VMA at 0x%lx (%s) to /dev/zero\n",
+		(unsigned long)addr, path);
+
+	/* Open /dev/zero once and reuse */
+	if (devzero_fd < 0) {
+		devzero_fd = open("/dev/zero", O_RDWR);
+		if (devzero_fd < 0) {
+			pr_perror("Failed to open /dev/zero");
+			return -1;
+		}
+	}
+
+	*plugin_fd = devzero_fd;
+	*new_pgoff = 0;
+
+	return 1; /* Tell CRIU to use our fd */
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, cuda_plugin_update_vma_map)
 
 /**
  * Check if a CUDA device is available on the system
