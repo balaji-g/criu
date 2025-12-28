@@ -1114,8 +1114,17 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 		}
 
 		if (!val) {
-			pr_err("Can't dump a pid namespace without the process init\n");
-			return -1;
+			/*
+			 * When --skip-mnt-ns is set, we're likely dumping a child process
+			 * in a container (not the init). Skip this check since Kubernetes
+			 * will handle namespace recreation on restore.
+			 */
+			if (opts.skip_mnt_ns) {
+				pr_warn("Skipping pid namespace init check (--skip-mnt-ns)\n");
+			} else {
+				pr_err("Can't dump a pid namespace without the process init\n");
+				return -1;
+			}
 		}
 	}
 
