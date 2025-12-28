@@ -442,6 +442,13 @@ int cuda_plugin_pause_devices(int pid)
 		return -ENOTSUP;
 	}
 
+	/*
+	 * Skip cuda-checkpoint lock call - it hangs on some workloads (vLLM).
+	 * The DUMP_EXT_FILE and HANDLE_DEVICE_VMA hooks handle device skipping.
+	 */
+	pr_info("Skipping cuda-checkpoint lock for pid %d (NVCRYO mode)\n", pid);
+	return 0;
+
 	restore_tid = get_cuda_restore_tid(pid);
 
 	if (restore_tid == -1) {
