@@ -1,7 +1,35 @@
-# Building CRIU with io_uring Support
+# Building CRIU with io_uring and Kubernetes Support
 
-**Date:** December 9, 2025  
+**Date:** December 27, 2025  
 **Tested on:** Ubuntu 24.04 (Noble)
+
+## Features
+
+This fork includes:
+- **io_uring checkpoint/restore** - Full support for Linux async I/O
+- **GPU container support** - CUDA plugin integration with nvidia cuda-checkpoint
+- **Kubernetes container migration** - Special flags for container live migration
+
+### Kubernetes Container Flags
+
+| Flag | Description |
+|------|-------------|
+| `--skip-mnt-ns` | Skip mount namespace restoration. Use when restoring into existing container. |
+| `--skip-file-validation` | Skip file size/build-id checks. Use when container images differ. |
+| `--portable` | Create portable checkpoint for cross-node migration. |
+| `--skip-fsnotify` | Skip inotify/fanotify watches. Use for ML workloads. |
+| `--skip-in-flight` | Skip in-flight TCP connections during dump. |
+| `--tcp-close` | Close TCP connections on restore instead of re-establishing. |
+
+### criu-ns Script
+
+For restoring inside containers, use `scripts/criu-ns` to run CRIU in its own PID namespace:
+
+```bash
+./scripts/criu-ns restore --criu-binary /path/to/criu -D /checkpoint ...
+```
+
+This avoids PID conflicts between the restore container and checkpointed processes.
 
 ## Prerequisites
 
@@ -198,6 +226,62 @@ Needs syscall table entries for:
 - ❌ mips
 - ❌ riscv64
 - ❌ loongarch64
+
+## Kubernetes Container Restore
+
+### Checkpointing GPU Containers
+
+```bash
+# Checkpoint a GPU container process (not PID 1)
+./criu dump -t $APP_PID \
+  -D /checkpoint \
+  --shell-job \
+  --leave-running \
+  --tcp-established \
+  --skip-in-flight \
+  --skip-fsnotify \
+  --link-remap \
+  --network-lock none \
+  --libdir /path/to/plugins \
+  -v1
+```
+
+### Restoring in Kubernetes Pods
+
+Use `criu-ns` wrapper to handle PID namespace conflicts:
+
+```bash
+./scripts/criu-ns restore \
+  --criu-binary /path/to/criu \
+  -D /checkpoint \
+  --shell-job \
+  --tcp-close \
+  --skip-in-flight \
+  --skip-file-validation \
+  --libdir /path/to/plugins \
+  -v1
+```
+
+### Common Issues
+
+| Error | Solution |
+|-------|----------|
+| `Current sid X intersects with pid Y` | Use `criu-ns` wrapper |
+| `Can't dump a pid namespace without process init` | Add `--skip-mnt-ns` on dump |
+| `File has bad size` | Add `--skip-file-validation` on restore |
+| `Can't restore ext mount` | Mount handling improved, should skip gracefully |
+| `epoll: Can't add event` | Related to io_uring, ensure `VLLM_DISABLE_IO_URING=1` |
+
+### ML/GPU Workloads
+
+For vLLM and similar workloads:
+```bash
+# Environment variables
+export VLLM_DISABLE_IO_URING=1  # Disable io_uring for CRIU compatibility
+export VLLM_HOST_IP=127.0.0.1   # Use localhost for IPC
+export GLOO_SOCKET_IFNAME=lo    # Force Gloo to loopback
+export HF_HUB_OFFLINE=1         # Disable network on restore
+```
 
 
 
