@@ -1098,6 +1098,18 @@ static int resolve_shared_mounts(struct mount_info *info)
 				continue;
 			}
 
+			/*
+			 * When --skip-mnt-ns is set, skip unreachable sharing validation.
+			 * This is safe for Kubernetes containers where the runtime owns
+			 * the mount namespace and will recreate mounts on restore.
+			 * Without this, NVIDIA + K8s mount hierarchies cause dump failures.
+			 */
+			if (opts.skip_mnt_ns) {
+				pr_warn("Mount %d %s has unreachable sharing, skipping (--skip-mnt-ns)\n",
+					m->mnt_id, m->ns_mountpoint);
+				continue;
+			}
+
 			pr_err("Mount %d %s (master_id: %d shared_id: %d) "
 			       "has unreachable sharing. Try --enable-external-masters.\n",
 			       m->mnt_id, m->ns_mountpoint, m->master_id, m->shared_id);

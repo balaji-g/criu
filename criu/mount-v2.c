@@ -194,18 +194,28 @@ int resolve_shared_mounts_v2(void)
 					source = opts.root;
 
 				if (!source) {
-					pr_err("Sharing group (%d, %d) "
-					       "has unreachable sharing. Try --enable-external-masters.\n",
-					       sg->shared_id, sg->master_id);
-					return -1;
+					/*
+					 * When --skip-mnt-ns is set, skip unreachable sharing validation.
+					 * Safe for Kubernetes where runtime owns mount namespace.
+					 */
+					if (opts.skip_mnt_ns) {
+						pr_warn("Sharing group (%d, %d) has unreachable sharing, skipping (--skip-mnt-ns)\n",
+							sg->shared_id, sg->master_id);
+						sg->source = "/";  /* Use root as fallback source */
+					} else {
+						pr_err("Sharing group (%d, %d) "
+						       "has unreachable sharing. Try --enable-external-masters.\n",
+						       sg->shared_id, sg->master_id);
+						return -1;
+					}
 				}
 
-				sg->source = source;
+				sg->source = sg->source ? sg->source : source;
 				list_for_each_entry(s, &sg->siblings, siblings)
 					s->source = sg->source;
 
 				pr_debug("Detected external slavery for shared group (%d, %d) with source %s\n",
-					 sg->shared_id, sg->master_id, source);
+					 sg->shared_id, sg->master_id, sg->source);
 			}
 		}
 	}
