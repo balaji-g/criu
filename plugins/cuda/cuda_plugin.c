@@ -581,6 +581,9 @@ int cuda_plugin_resume_devices_late(int pid)
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_devices_late)
 
+/* Forward declaration - checks if a device major number is an NVIDIA device */
+static bool is_nvidia_device_major(unsigned int maj);
+
 /**
  * Handle NVIDIA device VMAs during dump.
  * This hook is called when CRIU encounters a device file mmap.
@@ -588,13 +591,9 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_
  */
 int cuda_plugin_handle_device_vma(int fd, const struct stat *st_buf)
 {
-	/* NVIDIA device major numbers:
-	 * 195 = nvidia (nvidia0, nvidiactl, nvidia-modeset)
-	 * 506 = nvidia-uvm (nvidia-uvm, nvidia-uvm-tools)
-	 */
 	unsigned int major_num = major(st_buf->st_rdev);
 
-	if (major_num == 195 || major_num == 506) {
+	if (is_nvidia_device_major(major_num)) {
 		pr_info("CUDA plugin handling NVIDIA device VMA (major %d, minor %d)\n",
 			major_num, minor(st_buf->st_rdev));
 
