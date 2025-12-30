@@ -568,6 +568,8 @@ interrupt:
 
 int cuda_plugin_resume_devices_late(int pid)
 {
+	int ret;
+
 	if (plugin_disabled) {
 		return -ENOTSUP;
 	}
@@ -576,8 +578,19 @@ int cuda_plugin_resume_devices_late(int pid)
 	 * Here, we assume that users expect the target process
 	 * to be in a "running" state after restore, even if it was
 	 * in a "locked" or "checkpointed" state during `criu dump`.
+	 *
+	 * If cuda-checkpoint is not available or fails, we continue anyway.
+	 * The application may be using external GPU checkpoint/restore
+	 * (e.g., via GPUCR library and SIGUSR1/SIGUSR2 signals).
 	 */
-	return resume_device(pid, 1, CUDA_TASK_RUNNING);
+	ret = resume_device(pid, 1, CUDA_TASK_RUNNING);
+	if (ret != 0) {
+		pr_warn("CUDA plugin: resume_device failed for PID %d (ret=%d), "
+			"continuing anyway (external GPU restore may be used)\n", pid, ret);
+		/* Return 0 to not fail the restore - let external restore handle it */
+		return 0;
+	}
+	return 0;
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_devices_late)
 
@@ -621,25 +634,36 @@ int cuda_plugin_update_vma_map(const char *path, const uint64_t addr,
 			       const uint64_t old_pgoff, uint64_t *new_pgoff, int *plugin_fd)
 {
 	static int devzero_fd = -1;
+	int dup_fd;
 
 	/* Check if this is an NVIDIA device path */
 	if (strstr(path, "/dev/nvidia") == NULL && strstr(path, "nvidia-uvm") == NULL) {
 		return -ENOTSUP; /* Not our device */
 	}
 
-	pr_info("CUDA plugin: mapping NVIDIA VMA at 0x%lx (%s) to /dev/zero\n",
+	pr_debug("CUDA plugin: mapping NVIDIA VMA at 0x%lx (%s) to /dev/zero\n",
 		(unsigned long)addr, path);
 
-	/* Open /dev/zero once and reuse */
+	/* Open /dev/zero once and keep it */
 	if (devzero_fd < 0) {
 		devzero_fd = open("/dev/zero", O_RDWR);
 		if (devzero_fd < 0) {
-			pr_perror("Failed to open /dev/zero");
+			pr_perror("CUDA plugin: failed to open /dev/zero");
 			return -1;
 		}
 	}
 
-	*plugin_fd = devzero_fd;
+	/*
+	 * CRIU will dup and close the returned fd, so we must return a dup'd copy.
+	 * We keep devzero_fd for ourselves, and return a fresh dup each time.
+	 */
+	dup_fd = dup(devzero_fd);
+	if (dup_fd < 0) {
+		pr_perror("CUDA plugin: failed to dup /dev/zero fd");
+		return -1;
+	}
+
+	*plugin_fd = dup_fd;
 	*new_pgoff = 0;
 
 	return 1; /* Tell CRIU to use our fd */
@@ -659,23 +683,105 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, cuda_plugin_update_vma_m
  * - 510: nvidia-caps
  * - 511: nvidia-caps-imex-channels
  */
+/*
+ * NVIDIA device major numbers are dynamically allocated and can change
+ * between systems, kernel versions, and driver versions.
+ * We detect them at runtime by reading /proc/devices.
+ */
+static int nvidia_major = -1;        /* nvidia, nvidiactl, nvidia-modeset */
+static int nvidia_uvm_major = -1;    /* nvidia-uvm */
+static int nvidia_caps_major = -1;   /* nvidia-caps */
+static bool majors_initialized = false;
+
+static void init_nvidia_majors(void)
+{
+	FILE *f;
+	char line[256];
+	
+	if (majors_initialized)
+		return;
+	
+	majors_initialized = true;
+	
+	f = fopen("/proc/devices", "r");
+	if (!f)
+		return;
+	
+	while (fgets(line, sizeof(line), f)) {
+		int major;
+		char name[64];
+		
+		if (sscanf(line, "%d %63s", &major, name) != 2)
+			continue;
+		
+		if (strcmp(name, "nvidia") == 0 || 
+		    strcmp(name, "nvidiactl") == 0 ||
+		    strcmp(name, "nvidia-modeset") == 0) {
+			nvidia_major = major;
+		} else if (strcmp(name, "nvidia-uvm") == 0) {
+			nvidia_uvm_major = major;
+		} else if (strstr(name, "nvidia-caps") != NULL ||
+			   strstr(name, "nvidia-nvswitch") != NULL ||
+			   strstr(name, "nvidia-nvlink") != NULL) {
+			nvidia_caps_major = major;
+		}
+	}
+	
+	fclose(f);
+	
+	pr_info("Detected NVIDIA majors: nvidia=%d, uvm=%d, caps=%d\n",
+		nvidia_major, nvidia_uvm_major, nvidia_caps_major);
+}
+
 static bool is_nvidia_device_major(unsigned int maj)
 {
+	init_nvidia_majors();
+	
+	if (nvidia_major > 0 && (int)maj == nvidia_major)
+		return true;
+	if (nvidia_uvm_major > 0 && (int)maj == nvidia_uvm_major)
+		return true;
+	if (nvidia_caps_major > 0 && (int)maj == nvidia_caps_major)
+		return true;
+	
+	/* Fallback to common known values if detection failed */
 	switch (maj) {
-	case 195:  /* nvidia */
-	case 235:  /* nvidia-uvm */
-	case 509:  /* nvidia-nvswitch */
-	case 510:  /* nvidia-caps */
-	case 511:  /* nvidia-caps-imex-channels */
+	case 195:  /* nvidia - usually static */
 		return true;
 	default:
 		return false;
 	}
 }
 
+/*
+ * Save NVIDIA device file mappings to a file during dump.
+ * Format: one line per file "id path\n"
+ */
+#define NVIDIA_FILES_IMG "nvidia-files.img"
+static FILE *nvidia_files_fp = NULL;
+
+static void save_nvidia_file_mapping(int id, const char *path)
+{
+	if (!nvidia_files_fp) {
+		char img_path[PATH_MAX];
+		snprintf(img_path, sizeof(img_path), "%s/%s", opts.imgs_dir, NVIDIA_FILES_IMG);
+		nvidia_files_fp = fopen(img_path, "w");
+		if (!nvidia_files_fp) {
+			pr_perror("Failed to create %s", img_path);
+			return;
+		}
+	}
+	fprintf(nvidia_files_fp, "%d %s\n", id, path);
+	fflush(nvidia_files_fp);
+	pr_debug("CUDA plugin: saved mapping id=0x%x -> %s\n", id, path);
+}
+
 int cuda_plugin_dump_file(int fd, int id)
 {
 	struct stat st;
+	char path[256];
+	char fd_link[64];
+	ssize_t len;
 
 	if (fstat(fd, &st) == -1) {
 		return -ENOTSUP; /* Can't stat, not our file */
@@ -686,13 +792,135 @@ int cuda_plugin_dump_file(int fd, int id)
 		return -ENOTSUP; /* Not an NVIDIA device */
 	}
 
-	pr_info("CUDA plugin: skipping NVIDIA device fd %d (major %d, minor %d) - will be restored by cuda-checkpoint\n",
-		fd, major(st.st_rdev), minor(st.st_rdev));
+	/* Get the actual device path */
+	snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%d", fd);
+	len = readlink(fd_link, path, sizeof(path) - 1);
+	if (len > 0) {
+		path[len] = '\0';
+		save_nvidia_file_mapping(id, path);
+	} else {
+		/* Fallback based on minor number */
+		if (minor(st.st_rdev) == 255) {
+			save_nvidia_file_mapping(id, "/dev/nvidiactl");
+		} else if (minor(st.st_rdev) == 0 && major(st.st_rdev) != 195) {
+			save_nvidia_file_mapping(id, "/dev/nvidia-uvm");
+		} else {
+			snprintf(path, sizeof(path), "/dev/nvidia%d", minor(st.st_rdev));
+			save_nvidia_file_mapping(id, path);
+		}
+	}
+
+	pr_info("CUDA plugin: marking NVIDIA device fd %d id 0x%x (%s) as external\n",
+		fd, id, path);
 
 	/* Return 0 to tell CRIU we handled this file (skip dumping it) */
 	return 0;
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__DUMP_EXT_FILE, cuda_plugin_dump_file)
+
+/**
+ * Restore an external NVIDIA device file.
+ * CRIU calls this during restore for each ext file we claimed during dump.
+ */
+/*
+ * Load NVIDIA device file mappings saved during dump.
+ */
+#define MAX_NVIDIA_FILES 512
+static struct {
+	int id;
+	char path[256];
+} nvidia_file_map[MAX_NVIDIA_FILES];
+static int nvidia_file_map_count = 0;
+static bool nvidia_file_map_loaded = false;
+
+static void load_nvidia_file_mappings(void)
+{
+	char img_path[PATH_MAX];
+	FILE *fp;
+	int id;
+	char path[256];
+
+	if (nvidia_file_map_loaded)
+		return;
+	nvidia_file_map_loaded = true;
+
+	snprintf(img_path, sizeof(img_path), "%s/%s", opts.imgs_dir, NVIDIA_FILES_IMG);
+	fp = fopen(img_path, "r");
+	if (!fp) {
+		pr_debug("CUDA plugin: no %s found, using fallback restore\n", NVIDIA_FILES_IMG);
+		return;
+	}
+
+	while (fscanf(fp, "%d %255s", &id, path) == 2) {
+		if (nvidia_file_map_count >= MAX_NVIDIA_FILES) {
+			pr_warn("CUDA plugin: too many NVIDIA files, truncating\n");
+			break;
+		}
+		nvidia_file_map[nvidia_file_map_count].id = id;
+		strncpy(nvidia_file_map[nvidia_file_map_count].path, path, 255);
+		nvidia_file_map[nvidia_file_map_count].path[255] = '\0';
+		nvidia_file_map_count++;
+	}
+	fclose(fp);
+	pr_info("CUDA plugin: loaded %d NVIDIA file mappings\n", nvidia_file_map_count);
+}
+
+static const char *find_nvidia_path_for_id(int id)
+{
+	load_nvidia_file_mappings();
+	for (int i = 0; i < nvidia_file_map_count; i++) {
+		if (nvidia_file_map[i].id == id)
+			return nvidia_file_map[i].path;
+	}
+	return NULL;
+}
+
+int cuda_plugin_restore_file(int id, bool *retry_needed)
+{
+	int fd;
+	const char *path;
+
+	*retry_needed = false;
+
+	if (plugin_disabled) {
+		pr_debug("CUDA plugin: plugin disabled, returning ENOTSUP\n");
+		return -ENOTSUP;
+	}
+
+	/* Look up the original path for this file ID */
+	path = find_nvidia_path_for_id(id);
+	if (path) {
+		fd = open(path, O_RDWR);
+		if (fd >= 0) {
+			pr_debug("CUDA plugin: restored id 0x%x as %s (fd=%d)\n", id, path, fd);
+			return fd;
+		}
+		pr_warn("CUDA plugin: can't open saved path %s for id 0x%x: %s\n", 
+			path, id, strerror(errno));
+	}
+
+	/* Fallback: try common NVIDIA device paths */
+	const char *fallback_paths[] = {
+		"/dev/nvidia0",
+		"/dev/nvidiactl",
+		"/dev/nvidia-uvm",
+		"/dev/nvidia-modeset",
+		NULL
+	};
+	
+	for (int i = 0; fallback_paths[i]; i++) {
+		fd = open(fallback_paths[i], O_RDWR);
+		if (fd >= 0) {
+			pr_debug("CUDA plugin: restored id 0x%x as %s (fallback, fd=%d)\n", 
+				id, fallback_paths[i], fd);
+			return fd;
+		}
+	}
+	
+	pr_err("CUDA plugin: can't restore id 0x%x - all paths failed\n", id);
+	return -ENOENT;
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESTORE_EXT_FILE, cuda_plugin_restore_file)
 
 /**
  * Check if a CUDA device is available on the system
@@ -733,15 +961,13 @@ int cuda_plugin_init(int stage)
 
 	ret = cuda_checkpoint_supports_flag("--action");
 	if (ret == -1) {
+		/* cuda-checkpoint not found - this is OK if using external GPU checkpoint (gpucr) */
 		pr_warn("check that %s is present in $PATH\n", CUDA_CHECKPOINT);
-		plugin_disabled = true;
-		return 0;
-	}
-
-	if (ret == 0) {
-		pr_warn("cuda-checkpoint --action flag not supported, an r555 or higher version driver is required. Disabling CUDA plugin\n");
-		plugin_disabled = true;
-		return 0;
+		pr_info("CUDA plugin will use fallback mode (external GPU checkpoint via signals)\n");
+		/* Don't disable - allow the plugin to handle device FDs */
+	} else if (ret == 0) {
+		pr_warn("cuda-checkpoint --action flag not supported, an r555 or higher version driver is required\n");
+		/* Still continue - allow device FD handling */
 	}
 
 	pr_info("initialized: %s stage %d\n", CR_PLUGIN_DESC.name, stage);
