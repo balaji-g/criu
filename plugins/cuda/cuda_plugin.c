@@ -687,11 +687,31 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, cuda_plugin_update_vma_m
  * NVIDIA device major numbers are dynamically allocated and can change
  * between systems, kernel versions, and driver versions.
  * We detect them at runtime by reading /proc/devices.
+ *
+ * Known NVIDIA device types:
+ * - nvidia, nvidiactl, nvidia-modeset (usually 195)
+ * - nvidia-uvm (dynamic, e.g., 507)
+ * - nvidia-nvswitch (dynamic, e.g., 508)
+ * - nvidia-nvlink (dynamic, e.g., 509)
+ * - nvidia-caps (dynamic, e.g., 510)
+ * - nvidia-caps-imex-channels (dynamic, e.g., 511)
  */
-static int nvidia_major = -1;        /* nvidia, nvidiactl, nvidia-modeset */
-static int nvidia_uvm_major = -1;    /* nvidia-uvm */
-static int nvidia_caps_major = -1;   /* nvidia-caps */
+#define MAX_NVIDIA_MAJORS 16
+static int nvidia_majors[MAX_NVIDIA_MAJORS];
+static int nvidia_major_count = 0;
 static bool majors_initialized = false;
+
+static void add_nvidia_major(int major)
+{
+	/* Check if already added */
+	for (int i = 0; i < nvidia_major_count; i++) {
+		if (nvidia_majors[i] == major)
+			return;
+	}
+	if (nvidia_major_count < MAX_NVIDIA_MAJORS) {
+		nvidia_majors[nvidia_major_count++] = major;
+	}
+}
 
 static void init_nvidia_majors(void)
 {
@@ -714,43 +734,32 @@ static void init_nvidia_majors(void)
 		if (sscanf(line, "%d %63s", &major, name) != 2)
 			continue;
 		
-		if (strcmp(name, "nvidia") == 0 || 
-		    strcmp(name, "nvidiactl") == 0 ||
-		    strcmp(name, "nvidia-modeset") == 0) {
-			nvidia_major = major;
-		} else if (strcmp(name, "nvidia-uvm") == 0) {
-			nvidia_uvm_major = major;
-		} else if (strstr(name, "nvidia-caps") != NULL ||
-			   strstr(name, "nvidia-nvswitch") != NULL ||
-			   strstr(name, "nvidia-nvlink") != NULL) {
-			nvidia_caps_major = major;
+		/* Match any device name containing "nvidia" */
+		if (strstr(name, "nvidia") != NULL) {
+			add_nvidia_major(major);
+			pr_debug("CUDA plugin: detected NVIDIA device '%s' at major %d\n", name, major);
 		}
 	}
 	
 	fclose(f);
 	
-	pr_info("Detected NVIDIA majors: nvidia=%d, uvm=%d, caps=%d\n",
-		nvidia_major, nvidia_uvm_major, nvidia_caps_major);
+	pr_info("CUDA plugin: detected %d NVIDIA device majors\n", nvidia_major_count);
 }
 
 static bool is_nvidia_device_major(unsigned int maj)
 {
 	init_nvidia_majors();
 	
-	if (nvidia_major > 0 && (int)maj == nvidia_major)
-		return true;
-	if (nvidia_uvm_major > 0 && (int)maj == nvidia_uvm_major)
-		return true;
-	if (nvidia_caps_major > 0 && (int)maj == nvidia_caps_major)
-		return true;
+	for (int i = 0; i < nvidia_major_count; i++) {
+		if ((int)maj == nvidia_majors[i])
+			return true;
+	}
 	
 	/* Fallback to common known values if detection failed */
-	switch (maj) {
-	case 195:  /* nvidia - usually static */
+	if (maj == 195)  /* nvidia - usually static */
 		return true;
-	default:
-		return false;
-	}
+	
+	return false;
 }
 
 /*
