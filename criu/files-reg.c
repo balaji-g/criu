@@ -2285,6 +2285,18 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 ext:
 	tmp = open_cb(mntns_root, rfi, arg);
 	if (tmp < 0) {
+		/*
+		 * Special case: -ENOENT from open_cb means --skip-missing-files
+		 * was used and the file doesn't exist. Return -1 to indicate
+		 * the FD should be skipped, but don't treat it as a fatal error.
+		 */
+		if (tmp == -ENOENT && opts.skip_missing_files) {
+			pr_info("Skipping restore of missing file %s\n", rfi->path);
+			close_safe(&inh_fd);
+			if (rfi->remap)
+				mutex_unlock(remap_open_lock);
+			return -ENOENT;  /* Signal to caller to skip this FD */
+		}
 		pr_perror("Can't open file %s", rfi->path);
 		close_safe(&inh_fd);
 		goto err;
@@ -2384,6 +2396,16 @@ int do_open_reg_noseek_flags(int ns_root_fd, struct reg_file_info *rfi, void *ar
 				pr_info("Opened %s from host instead of rootfs\n", host_path);
 				return fd;
 			}
+		}
+		/*
+		 * If --skip-missing-files is set and the file doesn't exist,
+		 * return a special value to indicate the file should be skipped.
+		 * This is useful for container migration where temp files, logs,
+		 * or library files may not exist in the new environment.
+		 */
+		if (opts.skip_missing_files && errno == ENOENT) {
+			pr_warn("Skipping missing file %s (--skip-missing-files)\n", rfi->path);
+			return -ENOENT;  /* Special return value to indicate skip */
 		}
 		pr_perror("Can't open file %s on restore", rfi->path);
 		return fd;
@@ -2545,8 +2567,21 @@ static int open_filemap(int pid, struct vma_area *vma)
 		} else {
 			ret = open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
 		}
-		if (ret < 0)
+		if (ret < 0) {
+			/*
+			 * If --skip-missing-files is set and open_path returned -ENOENT,
+			 * skip this VMA gracefully. The mmap will use MAP_ANONYMOUS instead.
+			 */
+			if (ret == -ENOENT && opts.skip_missing_files) {
+				pr_warn("Skipping VMA for missing file (will use anonymous mapping)\n");
+				vma->e->fd = -1;
+				ctx.fd = -1;
+				ctx.desc = NULL;
+				ctx.vma = vma;
+				return 0;
+			}
 			return ret;
+		}
 
 		filemap_ctx_fini();
 
@@ -2590,8 +2625,18 @@ static int open_fe_fd(struct file_desc *fd, int *new_fd)
 	int tmp;
 
 	tmp = open_path(fd, do_open_reg, NULL);
-	if (tmp < 0)
+	if (tmp < 0) {
+		/*
+		 * If --skip-missing-files is set and the file doesn't exist,
+		 * don't fail the entire restore. Just mark this FD as skipped.
+		 */
+		if (tmp == -ENOENT && opts.skip_missing_files) {
+			pr_warn("Skipping FD for missing file\n");
+			*new_fd = -1;
+			return 0;  /* Success - FD is skipped, not failed */
+		}
 		return -1;
+	}
 	*new_fd = tmp;
 	return 0;
 }
