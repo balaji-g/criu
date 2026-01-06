@@ -372,15 +372,6 @@ int cuda_plugin_checkpoint_devices(int pid)
 		return -ENOTSUP;
 	}
 
-	/*
-	 * Skip cuda-checkpoint call - it hangs on some workloads (vLLM).
-	 * The DUMP_EXT_FILE hook handles NVIDIA device FDs, and
-	 * HANDLE_DEVICE_VMA handles GPU memory mappings.
-	 * CUDA will reinitialize on restore.
-	 */
-	pr_info("Skipping cuda-checkpoint for pid %d (NVCRYO mode)\n", pid);
-	return 0;
-
 	restore_tid = get_cuda_restore_tid(pid);
 
 	/* We can possibly hit a race with cuInit() where we are past the point of
@@ -441,13 +432,6 @@ int cuda_plugin_pause_devices(int pid)
 	if (plugin_disabled) {
 		return -ENOTSUP;
 	}
-
-	/*
-	 * Skip cuda-checkpoint lock call - it hangs on some workloads (vLLM).
-	 * The DUMP_EXT_FILE and HANDLE_DEVICE_VMA hooks handle device skipping.
-	 */
-	pr_info("Skipping cuda-checkpoint lock for pid %d (NVCRYO mode)\n", pid);
-	return 0;
 
 	restore_tid = get_cuda_restore_tid(pid);
 

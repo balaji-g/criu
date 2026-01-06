@@ -854,6 +854,10 @@ int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
 
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
+		if (opts.skip_missing_fds) {
+			pr_warn("Skipping missing fd %d id %#x (--skip-missing-fds)\n", e->fd, e->id);
+			return 0;  /* Skip this FD, continue restore */
+		}
 		pr_err("No file for fd %d id %#x\n", e->fd, e->id);
 		return -1;
 	}

@@ -2271,10 +2271,10 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 				pr_warn("Skipping ghost file %s - runtime object (--skip-mnt-ns)\n", rfi->path);
 				mutex_unlock(remap_open_lock);
 				/*
-				 * Return special fd -1 to indicate skip.
-				 * Caller must handle this appropriately.
+				 * Return -ENOENT so that open_filemap can handle this
+				 * like --skip-missing-files (use anonymous mapping).
 				 */
-				return -1;
+				return -ENOENT;
 			}
 			pr_perror("Can't link %s -> %s", rfi->remap->rpath, rfi->path);
 			goto err;
@@ -2569,11 +2569,12 @@ static int open_filemap(int pid, struct vma_area *vma)
 		}
 		if (ret < 0) {
 			/*
-			 * If --skip-missing-files is set and open_path returned -ENOENT,
-			 * skip this VMA gracefully. The mmap will use MAP_ANONYMOUS instead.
+			 * If --skip-missing-files or --skip-mnt-ns is set and open_path 
+			 * returned -ENOENT, skip this VMA gracefully. 
+			 * The mmap will use MAP_ANONYMOUS instead.
 			 */
-			if (ret == -ENOENT && opts.skip_missing_files) {
-				pr_warn("Skipping VMA for missing file (will use anonymous mapping)\n");
+			if (ret == -ENOENT && (opts.skip_missing_files || opts.skip_mnt_ns)) {
+				pr_warn("Skipping VMA for missing/skipped file (will use anonymous mapping)\n");
 				vma->e->fd = -1;
 				ctx.fd = -1;
 				ctx.desc = NULL;

@@ -203,6 +203,8 @@ struct cr_options {
 	int skip_inet_sockets;  /* Skip inet sockets during dump for portable checkpoints */
 	int skip_unix_sockets;  /* Skip unix sockets during dump */
 	int skip_lsm;  /* Skip LSM (AppArmor/SELinux) profile restoration */
+	int skip_missing_files;  /* Skip files that don't exist on restore (e.g., temp logs) */
+	int skip_missing_fds;    /* Skip FDs that reference missing files (e.g., skipped unix sockets) */
 	int portable;  /* Portable checkpoint mode: skip sockets, temp files for cross-node migration */
 
 	/*
