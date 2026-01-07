@@ -648,6 +648,10 @@ static int collect_remap_linked(struct reg_file_info *rfi, RemapFilePathEntry *r
 
 	rdesc = find_file_desc_raw(FD_TYPES__REG, rpe->remap_id);
 	if (!rdesc) {
+		/* Debug: print path and flags to diagnose why skip isn't working */
+		pr_warn("Remap target %x not found for path '%s' (skip_mnt_ns=%d skip_missing=%d)\n",
+			rpe->remap_id, rfi->path, opts.skip_mnt_ns, opts.skip_missing_files);
+
 		/*
 		 * Remap target not found. For /dev/shm files (semaphores, shared memory)
 		 * when --skip-mnt-ns or --skip-missing-files is set, return -ENOENT
@@ -655,7 +659,7 @@ static int collect_remap_linked(struct reg_file_info *rfi, RemapFilePathEntry *r
 		 * These are runtime objects that don't need to be restored.
 		 */
 		if ((opts.skip_mnt_ns || opts.skip_missing_files) &&
-		    strstr(rfi->path, "dev/shm/")) {
+		    strstr(rfi->path, "dev/shm")) {
 			pr_warn("Skipping remap target %x for /dev/shm file %s (--skip-mnt-ns/--skip-missing-files)\n",
 				rpe->remap_id, rfi->path);
 			return -ENOENT;
