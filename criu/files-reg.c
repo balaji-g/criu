@@ -648,6 +648,18 @@ static int collect_remap_linked(struct reg_file_info *rfi, RemapFilePathEntry *r
 
 	rdesc = find_file_desc_raw(FD_TYPES__REG, rpe->remap_id);
 	if (!rdesc) {
+		/*
+		 * Remap target not found. For /dev/shm files (semaphores, shared memory)
+		 * when --skip-mnt-ns or --skip-missing-files is set, return -ENOENT
+		 * to allow the caller to skip this remap gracefully.
+		 * These are runtime objects that don't need to be restored.
+		 */
+		if ((opts.skip_mnt_ns || opts.skip_missing_files) &&
+		    strstr(rfi->path, "dev/shm/")) {
+			pr_warn("Skipping remap target %x for /dev/shm file %s (--skip-mnt-ns/--skip-missing-files)\n",
+				rpe->remap_id, rfi->path);
+			return -ENOENT;
+		}
 		pr_err("Can't find target file %x\n", rpe->remap_id);
 		return -1;
 	}
@@ -753,10 +765,23 @@ static int collect_one_remap(void *obj, ProtobufCMessage *msg, struct cr_img *i)
 		if (collect_remap_ghost(ri->rfi, ri->rpe))
 			return -1;
 		break;
-	case REMAP_TYPE__LINKED:
-		if (collect_remap_linked(ri->rfi, ri->rpe))
+	case REMAP_TYPE__LINKED: {
+		int ret = collect_remap_linked(ri->rfi, ri->rpe);
+		if (ret == -ENOENT) {
+			/*
+			 * Remap target not found but --skip-mnt-ns or --skip-missing-files
+			 * is set for /dev/shm file. Skip this remap - the file mapping
+			 * will be handled as anonymous memory.
+			 */
+			pr_info("Skipping linked remap for %s (target not found, will use anonymous mapping)\n",
+				ri->rfi->path);
+			ri->rfi->remap = NULL;
+			return 0;
+		}
+		if (ret)
 			return -1;
 		break;
+	}
 	case REMAP_TYPE__PROCFS:
 		if (collect_remap_dead_process(ri->rfi, rpe) < 0)
 			return -1;
