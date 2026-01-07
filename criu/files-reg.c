@@ -1222,6 +1222,23 @@ static int dump_linked_remap(char *path, int len, const struct fd_parms *parms, 
 	u32 lid;
 	RemapFilePathEntry rpe = REMAP_FILE_PATH_ENTRY__INIT;
 
+	/*
+	 * Production fix: Skip linked remaps for /dev/shm files when using --skip-mnt-ns.
+	 * 
+	 * /dev/shm contains POSIX semaphores and shared memory that are:
+	 * - Runtime objects specific to the source container
+	 * - Cannot be recreated identically on destination
+	 * - Memory contents are still captured in page images
+	 *
+	 * By skipping the remap, restore will treat this as anonymous memory.
+	 * The actual data (semaphore state, shared mem contents) is preserved
+	 * in pages-*.img and will be restored correctly.
+	 */
+	if (opts.skip_mnt_ns && strstr(path, "dev/shm")) {
+		pr_info("Skipping linked remap for %s (--skip-mnt-ns: will restore as anonymous memory)\n", path);
+		return 0;
+	}
+
 	if (create_link_remap(path, len, lfd, &lid, nsid, parms, fallback))
 		return -1;
 
