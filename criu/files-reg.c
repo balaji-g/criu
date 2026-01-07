@@ -1155,6 +1155,15 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
 	mntns_root = mntns_get_root_fd(nsid);
 
 	while (linkat_hard(lfd, "", mntns_root, link_name, ost->st_uid, ost->st_gid, AT_EMPTY_PATH) < 0) {
+		if (errno == EEXIST && opts.skip_mnt_ns && strstr(path, "dev/shm/")) {
+			/*
+			 * When using --skip-mnt-ns for container migration,
+			 * ghost files in /dev/shm (POSIX semaphores) may already exist.
+			 * Skip them - they're runtime objects that will be recreated.
+			 */
+			pr_warn("Skipping ghost file link for %s - already exists (--skip-mnt-ns)\n", path);
+			return 0;
+		}
 		if (errno != ENOENT) {
 			pr_perror("Can't link remap to %s", path);
 			return -1;
