@@ -1866,6 +1866,9 @@ static int catch_tasks(bool root_seized)
  * Detach from io_uring SQPOLL threads that were created during restore.
  * These are kernel threads that don't respond properly to ptrace and
  * will cause wait4() to hang if we try to interact with them.
+ *
+ * SQPOLL threads are special: they're in S (sleeping) state, not t (tracing stop).
+ * We need to interrupt them first, wait for them to stop, then detach.
  */
 static void detach_sqpoll_threads(void)
 {
@@ -1873,6 +1876,8 @@ static void detach_sqpoll_threads(void)
 	char comm[32];
 	char path[64];
 	int fd;
+
+	pr_info("Checking for io_uring SQPOLL threads to detach\n");
 
 	for_each_pstree_item(item) {
 		DIR *dir;
@@ -1889,6 +1894,7 @@ static void detach_sqpoll_threads(void)
 
 		while ((de = readdir(dir)) != NULL) {
 			pid_t tid;
+			int status;
 			
 			if (de->d_name[0] == '.')
 				continue;
@@ -1912,14 +1918,33 @@ static void detach_sqpoll_threads(void)
 				
 				/* Check for io_uring SQPOLL thread pattern: iou-sqp-<pid> */
 				if (strncmp(comm, "iou-sqp-", 8) == 0) {
-					pr_info("Detaching from io_uring SQPOLL thread %d (%s)\n", tid, comm);
-					ptrace(PTRACE_DETACH, tid, NULL, NULL);
+					pr_info("Found io_uring SQPOLL thread %d (%s), interrupting and detaching\n", tid, comm);
+					
+					/* SQPOLL threads are in S state, need to interrupt first */
+					if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) == 0) {
+						/* Wait for the thread to stop */
+						if (waitpid(tid, &status, __WALL) == tid) {
+							pr_info("SQPOLL thread %d stopped, detaching\n", tid);
+							if (ptrace(PTRACE_DETACH, tid, NULL, NULL) != 0) {
+								pr_perror("Failed to detach from SQPOLL thread %d", tid);
+							}
+						} else {
+							pr_warn("Failed to wait for SQPOLL thread %d\n", tid);
+							/* Try detaching anyway */
+							ptrace(PTRACE_DETACH, tid, NULL, NULL);
+						}
+					} else {
+						pr_warn("Failed to interrupt SQPOLL thread %d, trying direct detach\n", tid);
+						/* Thread might already be stopped, try detach anyway */
+						ptrace(PTRACE_DETACH, tid, NULL, NULL);
+					}
 				}
 			}
 			close(fd);
 		}
 		closedir(dir);
 	}
+	pr_info("Finished checking for SQPOLL threads\n");
 }
 
 static void finalize_restore(void)
