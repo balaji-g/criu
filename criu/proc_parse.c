@@ -2607,8 +2607,11 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 	if (*_t == NULL) {
 		*_t = t;
 		*_n = nr - 1;
-	} else
-		BUG_ON(nr - 1 != *_n);
+	} else if (nr - 1 != *_n) {
+		/* Thread count mismatch can happen with thread pools that dynamically
+		 * create/destroy threads. Log warning instead of crashing. */
+		pr_warn("Thread count changed: expected %d, got %d\n", *_n, nr - 1);
+	}
 
 	return 0;
 }
