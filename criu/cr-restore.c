@@ -1869,13 +1869,16 @@ static int catch_tasks(bool root_seized)
  *
  * SQPOLL threads are special: they're in S (sleeping) state, not t (tracing stop).
  * We need to interrupt them first, wait for them to stop, then detach.
+ *
+ * Returns the number of SQPOLL threads that were detached.
  */
-static void detach_sqpoll_threads(void)
+static int detach_sqpoll_threads(void)
 {
 	struct pstree_item *item;
 	char comm[32];
 	char path[64];
 	int fd;
+	int detached_count = 0;
 
 	pr_info("Checking for io_uring SQPOLL threads to detach\n");
 
@@ -1925,18 +1928,24 @@ static void detach_sqpoll_threads(void)
 						/* Wait for the thread to stop */
 						if (waitpid(tid, &status, __WALL) == tid) {
 							pr_info("SQPOLL thread %d stopped, detaching\n", tid);
-							if (ptrace(PTRACE_DETACH, tid, NULL, NULL) != 0) {
+							if (ptrace(PTRACE_DETACH, tid, NULL, NULL) == 0) {
+								detached_count++;
+							} else {
 								pr_perror("Failed to detach from SQPOLL thread %d", tid);
 							}
 						} else {
 							pr_warn("Failed to wait for SQPOLL thread %d\n", tid);
 							/* Try detaching anyway */
-							ptrace(PTRACE_DETACH, tid, NULL, NULL);
+							if (ptrace(PTRACE_DETACH, tid, NULL, NULL) == 0) {
+								detached_count++;
+							}
 						}
 					} else {
 						pr_warn("Failed to interrupt SQPOLL thread %d, trying direct detach\n", tid);
 						/* Thread might already be stopped, try detach anyway */
-						ptrace(PTRACE_DETACH, tid, NULL, NULL);
+						if (ptrace(PTRACE_DETACH, tid, NULL, NULL) == 0) {
+							detached_count++;
+						}
 					}
 				}
 			}
@@ -1944,15 +1953,13 @@ static void detach_sqpoll_threads(void)
 		}
 		closedir(dir);
 	}
-	pr_info("Finished checking for SQPOLL threads\n");
+	pr_info("Finished checking for SQPOLL threads, detached %d\n", detached_count);
+	return detached_count;
 }
 
 static void finalize_restore(void)
 {
 	struct pstree_item *item;
-
-	/* First, detach from any io_uring SQPOLL threads created during restore */
-	detach_sqpoll_threads();
 
 	for_each_pstree_item(item) {
 		pid_t pid = item->pid->real;
@@ -2320,6 +2327,21 @@ skip_ns_bouncing:
 		goto out_kill_network_unlocked;
 
 	__restore_switch_stage(CR_STATE_COMPLETE);
+
+	/*
+	 * Detach from io_uring SQPOLL threads BEFORE stopping all threads.
+	 * SQPOLL threads are kernel threads that can't be stopped via ptrace,
+	 * so we need to exclude them from the thread count and detach from them.
+	 */
+	{
+		int sqpoll_count = 0;
+		sqpoll_count = detach_sqpoll_threads();
+		if (sqpoll_count > 0) {
+			pr_info("Detached from %d SQPOLL thread(s), adjusting thread count from %d to %d\n",
+				sqpoll_count, task_entries->nr_threads, task_entries->nr_threads - sqpoll_count);
+			task_entries->nr_threads -= sqpoll_count;
+		}
+	}
 
 	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
 	if (ret) {
