@@ -2014,6 +2014,15 @@ static int finalize_restore_detach(void)
 				return -1;
 			}
 			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+				/*
+				 * ESRCH means the thread no longer exists - this can
+				 * happen for io_uring SQPOLL threads that were detached
+				 * earlier and have since exited. This is not an error.
+				 */
+				if (errno == ESRCH) {
+					pr_info("Thread %d no longer exists (already detached), skipping\n", pid);
+					continue;
+				}
 				pr_perror("Unable to detach %d", pid);
 				return -1;
 			}
