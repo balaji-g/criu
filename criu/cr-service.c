@@ -485,6 +485,15 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_skip_mnt_ns)
 		opts.skip_mnt_ns = req->skip_mnt_ns;
 
+	if (req->has_skip_missing_fds)
+		opts.skip_missing_fds = req->skip_missing_fds;
+
+	if (req->has_skip_missing_files)
+		opts.skip_missing_files = req->skip_missing_files;
+
+	if (req->has_portable)
+		opts.portable = req->portable;
+
 	if (req->has_tcp_close)
 		opts.tcp_close = req->tcp_close;
 
