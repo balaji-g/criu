@@ -2629,8 +2629,10 @@ static int open_filemap(int pid, struct vma_area *vma)
 			 * The mmap will use MAP_ANONYMOUS instead.
 			 */
 			if (ret == -ENOENT && (opts.skip_missing_files || opts.skip_mnt_ns)) {
-				pr_warn("Skipping VMA for missing/skipped file (will use anonymous mapping)\n");
+				struct reg_file_info *rfi = container_of(vma->vmfd, struct reg_file_info, d);
+				pr_warn("Using anonymous mapping for missing file: %s\n", rfi->path);
 				vma->e->fd = -1;
+				vma->e->flags |= MAP_ANONYMOUS;
 				ctx.fd = -1;
 				ctx.desc = NULL;
 				ctx.vma = vma;
