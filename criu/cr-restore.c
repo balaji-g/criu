@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <dirent.h>
 
 #include <fcntl.h>
 
@@ -1861,9 +1862,72 @@ static int catch_tasks(bool root_seized)
 	return 0;
 }
 
+/*
+ * Detach from io_uring SQPOLL threads that were created during restore.
+ * These are kernel threads that don't respond properly to ptrace and
+ * will cause wait4() to hang if we try to interact with them.
+ */
+static void detach_sqpoll_threads(void)
+{
+	struct pstree_item *item;
+	char comm[32];
+	char path[64];
+	int fd;
+
+	for_each_pstree_item(item) {
+		DIR *dir;
+		struct dirent *de;
+		pid_t pid = item->pid->real;
+
+		if (!task_alive(item))
+			continue;
+
+		snprintf(path, sizeof(path), "/proc/%d/task", pid);
+		dir = opendir(path);
+		if (!dir)
+			continue;
+
+		while ((de = readdir(dir)) != NULL) {
+			pid_t tid;
+			
+			if (de->d_name[0] == '.')
+				continue;
+			
+			tid = atoi(de->d_name);
+			if (tid <= 0)
+				continue;
+
+			/* Read thread comm to check if it's an SQPOLL thread */
+			snprintf(path, sizeof(path), "/proc/%d/task/%d/comm", pid, tid);
+			fd = open(path, O_RDONLY);
+			if (fd < 0)
+				continue;
+			
+			memset(comm, 0, sizeof(comm));
+			if (read(fd, comm, sizeof(comm) - 1) > 0) {
+				/* Remove trailing newline */
+				char *nl = strchr(comm, '\n');
+				if (nl)
+					*nl = '\0';
+				
+				/* Check for io_uring SQPOLL thread pattern: iou-sqp-<pid> */
+				if (strncmp(comm, "iou-sqp-", 8) == 0) {
+					pr_info("Detaching from io_uring SQPOLL thread %d (%s)\n", tid, comm);
+					ptrace(PTRACE_DETACH, tid, NULL, NULL);
+				}
+			}
+			close(fd);
+		}
+		closedir(dir);
+	}
+}
+
 static void finalize_restore(void)
 {
 	struct pstree_item *item;
+
+	/* First, detach from any io_uring SQPOLL threads created during restore */
+	detach_sqpoll_threads();
 
 	for_each_pstree_item(item) {
 		pid_t pid = item->pid->real;
