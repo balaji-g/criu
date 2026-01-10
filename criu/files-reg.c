@@ -500,6 +500,14 @@ static int create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, struct cr_im
 
 	mi = lookup_mnt_id(gf->remap.rmnt_id);
 	if (!mi) {
+		/*
+		 * With --skip-mnt-ns, mount info may not be available.
+		 * For /dev/shm files, try direct creation as a fallback.
+		 */
+		if (opts.skip_mnt_ns && strstr(gf->remap.rpath, "dev/shm/")) {
+			pr_info("Mount not found for ghost, trying direct /dev/shm creation\n");
+			return nomntns_create_ghost(gf, gfe, img);
+		}
 		pr_err("The %d mount is not found for ghost\n", gf->remap.rmnt_id);
 		return -1;
 	}
@@ -888,8 +896,17 @@ nomntns:
 		ret = unlink(path);
 
 	if (ret) {
-		pr_perror("Couldn't unlink remap %s", path);
-		return -1;
+		/*
+		 * With --skip-mnt-ns and ghost files in /dev/shm, the ghost file
+		 * may already be unlinked (we open + unlink in do_open_reg).
+		 * ENOENT is not fatal in this case.
+		 */
+		if (errno == ENOENT) {
+			pr_info("Remap %s already unlinked, continuing\n", path);
+		} else {
+			pr_perror("Couldn't unlink remap %s", path);
+			return -1;
+		}
 	}
 
 	remap->rpath[0] = 0;
@@ -2286,6 +2303,8 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 		}
 
 		mutex_lock(remap_open_lock);
+		{
+		static char tmp_path[PATH_MAX];
 		if (rfi->remap->is_dir) {
 			/*
 			 * FIXME Can't make directory under new name.
@@ -2294,7 +2313,6 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			orig_path = rfi->path;
 			rfi->path = rfi->remap->rpath;
 		} else if ((ret = rfi_remap(rfi, &level)) == 1) {
-			static char tmp_path[PATH_MAX];
 
 			/*
 			 * The file whose name we're trying to create
@@ -2318,22 +2336,24 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 		} else if (ret < 0) {
 			/*
 			 * When using --skip-mnt-ns for container migration,
-			 * ghost files in /dev/shm (POSIX semaphores) and /dev/
-			 * cannot be created in the new container's mount namespace.
-			 * These are runtime objects - warn and continue.
+			 * the link may fail. Try opening the ghost file directly
+			 * instead of failing. The ghost file at remap->rpath
+			 * should have been created by create_ghost().
 			 */
 			if (opts.skip_mnt_ns && strstr(rfi->path, "dev/shm/")) {
-				pr_warn("Skipping ghost file %s - runtime object (--skip-mnt-ns)\n", rfi->path);
-				mutex_unlock(remap_open_lock);
-				/*
-				 * Return -ENOENT so that open_filemap can handle this
-				 * like --skip-missing-files (use anonymous mapping).
-				 */
-				return -ENOENT;
+				pr_info("Link failed for %s, opening ghost directly at /%s\n", 
+					rfi->path, rfi->remap->rpath);
+				orig_path = rfi->path;
+				/* Use absolute path to ghost file (use tmp_path which is already static) */
+				snprintf(tmp_path, sizeof(tmp_path), "/%s", rfi->remap->rpath);
+				rfi->path = tmp_path;
+				/* Continue to open the ghost file directly */
+			} else {
+				pr_perror("Can't link %s -> %s", rfi->remap->rpath, rfi->path);
+				goto err;
 			}
-			pr_perror("Can't link %s -> %s", rfi->remap->rpath, rfi->path);
-			goto err;
 		}
+		}  /* end of static tmp_path block */
 	}
 
 	mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
@@ -2685,11 +2705,12 @@ static int open_fe_fd(struct file_desc *fd, int *new_fd)
 	tmp = open_path(fd, do_open_reg, NULL);
 	if (tmp < 0) {
 		/*
-		 * If --skip-missing-files is set and the file doesn't exist,
+		 * If --skip-missing-files or --skip-mnt-ns is set and the file
+		 * doesn't exist or is a runtime object (like /dev/shm semaphores),
 		 * don't fail the entire restore. Just mark this FD as skipped.
 		 */
-		if (tmp == -ENOENT && opts.skip_missing_files) {
-			pr_warn("Skipping FD for missing file\n");
+		if (tmp == -ENOENT && (opts.skip_missing_files || opts.skip_mnt_ns)) {
+			pr_warn("Skipping FD for missing/skipped file\n");
 			*new_fd = -1;
 			return 0;  /* Success - FD is skipped, not failed */
 		}

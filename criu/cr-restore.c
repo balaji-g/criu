@@ -44,6 +44,7 @@
 #include "sk-inet.h"
 #include "eventfd.h"
 #include "eventpoll.h"
+#include "io_uring.h"
 #include "signalfd.h"
 #include "proc_parse.h"
 #include "pie/restorer-blob.h"
@@ -284,7 +285,7 @@ static struct collect_image_info *cinfos_files[] = {
 	&unix_sk_cinfo,	      &fifo_cinfo,     &pipe_cinfo,    &nsfile_cinfo,	    &packet_sk_cinfo,
 	&netlink_sk_cinfo,    &eventfd_cinfo,  &epoll_cinfo,   &epoll_tfd_cinfo,    &signalfd_cinfo,
 	&tunfile_cinfo,	      &timerfd_cinfo,  &inotify_cinfo, &inotify_mark_cinfo, &fanotify_cinfo,
-	&fanotify_mark_cinfo, &ext_file_cinfo, &memfd_cinfo, &pidfd_cinfo
+	&fanotify_mark_cinfo, &ext_file_cinfo, &memfd_cinfo, &pidfd_cinfo, &io_uring_cinfo
 };
 
 /* These images are required to restore namespaces */
@@ -1931,7 +1932,17 @@ static int detach_sqpoll_threads(void)
 							if (ptrace(PTRACE_DETACH, tid, NULL, NULL) == 0) {
 								detached_count++;
 							} else {
-								pr_perror("Failed to detach from SQPOLL thread %d", tid);
+								/*
+								 * If detach fails with ESRCH, thread died.
+								 * Still count it as handled since it won't
+								 * stop on rt_sigreturn.
+								 */
+								if (errno == ESRCH) {
+									pr_warn("SQPOLL thread %d died, counting as handled\n", tid);
+									detached_count++;
+								} else {
+									pr_perror("Failed to detach from SQPOLL thread %d", tid);
+								}
 							}
 						} else {
 							pr_warn("Failed to wait for SQPOLL thread %d\n", tid);

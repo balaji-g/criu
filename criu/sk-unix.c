@@ -335,7 +335,12 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 	/* Skip unix sockets for portable checkpoints */
 	if (opts.skip_unix_sockets || opts.portable) {
 		pr_info("Skipping unix socket fd %d (--skip-unix-sockets/--portable)\n", lfd);
-		return 0;
+		/*
+		 * Return -ENOENT to indicate this fd should be skipped entirely.
+		 * This tells dump_task_files_seized to NOT write fdinfo for this fd,
+		 * avoiding orphan fdinfo entries that reference non-existent files.
+		 */
+		return -ENOENT;
 	}
 
 	m = xmalloc(sizeof(UnixSkEntry) + sizeof(SkOptsEntry) + sizeof(FilePermsEntry) + sizeof(FownEntry));

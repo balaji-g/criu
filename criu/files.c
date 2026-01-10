@@ -57,6 +57,7 @@
 #include "images/ext-file.pb-c.h"
 
 #include "plugin.h"
+#include "io_uring.h"
 
 #define FDESC_HASH_SIZE 64
 static struct hlist_head file_desc_hash[FDESC_HASH_SIZE];
@@ -547,6 +548,8 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &timerfd_dump_ops;
 		else if (is_pidfd_link(link))
 			ops = &pidfd_dump_ops;
+		else if (strstr(link, "io_uring"))
+			ops = &io_uring_dump_ops;
 #ifdef CONFIG_HAS_LIBBPF
 		else if (is_bpfmap_link(link))
 			ops = &bpfmap_dump_ops;
@@ -655,6 +658,15 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 			FdinfoEntry e = FDINFO_ENTRY__INIT;
 
 			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
+			if (ret == -ENOENT) {
+				/*
+				 * -ENOENT means the fd was intentionally skipped (e.g., unix/inet
+				 * socket with --portable). Don't write fdinfo for it and continue.
+				 */
+				pr_debug("fd %d skipped, not writing fdinfo\n", dfds->fds[i + off]);
+				ret = 0;
+				continue;
+			}
 			if (ret)
 				break;
 
@@ -1168,6 +1180,15 @@ static int open_fd(struct fdinfo_list_entry *fle)
 	if (ret != -1 && new_fd >= 0) {
 		if (setup_and_serve_out(fle, new_fd) < 0)
 			return -1;
+	} else if (ret == 0 && new_fd == -1) {
+		/*
+		 * FD was intentionally skipped (e.g., ghost file in /dev/shm
+		 * with --skip-mnt-ns). We still mark fle as OPEN but skip serving.
+		 * Dependents in receive_fd() will timeout since no fd is sent.
+		 * This is handled by recv_fd_from_peer returning without blocking.
+		 */
+		pr_warn("FD skipped for file_desc %#x (owner fd %d pid %d)\n", 
+			d->id, fle->fe->fd, fle->pid);
 	}
 out:
 	if (ret == 0)
@@ -1178,6 +1199,35 @@ out:
 static int receive_fd(struct fdinfo_list_entry *fle)
 {
 	int ret;
+
+	/*
+	 * Check if this fd already exists and is io_uring.
+	 * Also check if we can create it by duping from a pre-created io_uring.
+	 */
+	{
+		char path[64], link[64];
+		int ret;
+
+		/* First check if target fd already exists as io_uring */
+		snprintf(path, sizeof(path), "/proc/self/fd/%d", fle->fe->fd);
+		ret = readlink(path, link, sizeof(link) - 1);
+		if (ret > 0) {
+			link[ret] = '\0';
+			if (strstr(link, "io_uring") != NULL) {
+				pr_info("\tfd %d is already io_uring, skip receive\n", fle->fe->fd);
+				if (fcntl(fle->fe->fd, F_SETFD, fle->fe->flags) == -1) {
+					pr_perror("Unable to set io_uring fd flags");
+					return -1;
+				}
+				return 0;
+			}
+		}
+
+		/*
+		 * Don't try to dup io_uring to stdin/stdout/stderr.
+		 * Those are legitimate fds that should not be io_uring.
+		 */
+	}
 
 	pr_info("\tReceive fd for %d\n", fle->fe->fd);
 
@@ -1220,6 +1270,13 @@ static int open_fdinfos(struct pstree_item *me)
 		list_for_each_entry_safe(fle, tmp, list, ps_list) {
 			st = fle->stage;
 			BUG_ON(st == FLE_RESTORED);
+
+			/*
+			 * io_uring fds are handled through the normal open path.
+			 * io_uring_open() groups them by file_desc->id and creates
+			 * ONE kernel object per group (reusing for subsequent fds).
+			 * This follows CRIU's file_desc pattern correctly.
+			 */
 			ret = open_fd(fle);
 			if (ret == -1) {
 				pr_err("Unable to open fd=%d id=%#x\n", fle->fe->fd, fle->fe->id);
@@ -1331,6 +1388,17 @@ int prepare_fds(struct pstree_item *me)
 			futex_wait_until(&fdt->fdt_lock, fdt->nr + 1);
 			goto out;
 		}
+	}
+
+	/*
+	 * Pre-create io_uring FDs before normal FD restore.
+	 * This ensures io_uring fds exist before epoll/other code tries to
+	 * reference them, avoiding hangs in open_fdinfos().
+	 */
+	ret = precreate_io_urings(me);
+	if (ret) {
+		pr_err("Failed to pre-create io_uring fds\n");
+		return ret;
 	}
 
 	ret = open_fdinfos(me);
@@ -1791,6 +1859,9 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 		break;
 	case FD_TYPES__PIDFD:
 		ret = collect_one_file_entry(fe, fe->pidfd->id, &fe->pidfd->base, &pidfd_cinfo);
+		break;
+	case FD_TYPES__IO_URING:
+		ret = collect_one_file_entry(fe, fe->iouring->id, &fe->iouring->base, &io_uring_cinfo);
 		break;
 #ifdef CONFIG_HAS_LIBBPF
 	case FD_TYPES__BPFMAP:
