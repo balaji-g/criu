@@ -1168,7 +1168,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		params.sq_thread_idle = ring->sq_thread_idle;
 	}
 
-	/* Create a new io_uring instance */
+	/* Create the io_uring instance */
 	fd = sys_io_uring_setup(ring->sq_entries, &params);
 	if (fd < 0) {
 		pr_err("io_uring_setup failed: %d\n", fd);
@@ -1348,6 +1348,56 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	}
 
 	pr_info("Restored io_uring ring at fd=%u\n", ring->fd);
+
+	/*
+	 * Replay deferred epoll registrations.
+	 * These were collected during eventpoll restore when io_uring
+	 * didn't exist yet. Now we can add the io_uring fd to epoll.
+	 */
+	if (ring->n_epoll_refs > 0) {
+		unsigned int i;
+		pr_info("  Replaying %u deferred epoll registration(s)\n", ring->n_epoll_refs);
+
+		for (i = 0; i < ring->n_epoll_refs; i++) {
+			struct {
+				uint32_t events;
+				uint64_t data;
+			} __attribute__((packed)) event;
+
+			event.events = ring->epoll_refs[i].events;
+			event.data = ring->epoll_refs[i].data;
+
+			/*
+			 * Direct syscall to epoll_ctl since it's not in compel wrappers.
+			 * __NR_epoll_ctl = 233 on x86_64
+			 */
+			{
+				register long _ret asm("rax");
+				register long _nr  asm("rax") = 233; /* __NR_epoll_ctl */
+				register long _a1  asm("rdi") = ring->epoll_refs[i].epoll_fd;
+				register long _a2  asm("rsi") = 1;   /* EPOLL_CTL_ADD */
+				register long _a3  asm("rdx") = ring->fd;
+				register long _a4  asm("r10") = (long)&event;
+
+				asm volatile("syscall"
+					     : "=a"(_ret)
+					     : "0"(_nr), "r"(_a1), "r"(_a2), "r"(_a3), "r"(_a4)
+					     : "memory", "rcx", "r11");
+				ret = _ret;
+			}
+
+			if (ret < 0) {
+				pr_err("  epoll_ctl(epoll=%u, io_uring=%u) failed: %ld\n",
+				       ring->epoll_refs[i].epoll_fd, ring->fd, ret);
+				/* Continue with other registrations */
+			} else {
+				pr_info("  Added io_uring fd %u to epoll %u (events=0x%x)\n",
+					ring->fd, ring->epoll_refs[i].epoll_fd,
+					ring->epoll_refs[i].events);
+			}
+		}
+	}
+
 	return 0;
 }
 

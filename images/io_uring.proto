@@ -26,6 +26,14 @@ message io_uring_vma {
 	/* pgoff = 0x10000000 -> SQEs (IORING_OFF_SQES) */
 }
 
+/* Epoll registration that monitors this io_uring fd */
+message io_uring_epoll_info {
+	required uint32 epoll_id	= 1;	/* Epoll file_desc id (0x0000a1, etc) */
+	required uint32 epoll_fd	= 2;	/* Epoll fd number */
+	required uint32 events		= 3;	/* epoll events mask */
+	required uint64 data		= 4;	/* epoll data (user pointer) */
+}
+
 message io_uring_entry {
 	required uint32 id		= 1;	/* File descriptor number */
 	required uint64 ino		= 2;	/* Inode number */
@@ -65,6 +73,10 @@ message io_uring_entry {
 
 	/* Multiple VMA mappings (uvloop creates multiple mmap()s on same ring fd) */
 	repeated io_uring_vma vmas	= 60;
+
+	/* Epoll registrations monitoring this io_uring fd */
+	/* CRITICAL: These must be restored AFTER io_uring_setup() to fix ordering issue */
+	repeated io_uring_epoll_info epoll_refs	= 61;
 
 	/* Registered resources */
 	optional uint32 user_files	= 50;	/* Number of registered files */

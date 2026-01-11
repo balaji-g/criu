@@ -116,6 +116,74 @@ struct io_uring_fdinfo {
 	uint32_t user_bufs;
 };
 
+/*
+ * Deferred epoll registrations for io_uring.
+ *
+ * Problem: epoll_retore_tfd() runs BEFORE io_uring_setup() in PIE.
+ * When epoll tries to add io_uring fd to epoll, the fd doesn't exist yet.
+ *
+ * Solution:
+ * 1. eventpoll_retore_tfd() detects io_uring tfds and stores them here
+ * 2. prepare_io_urings() copies them to rst_io_uring_ring structs
+ * 3. PIE's restore_io_uring_ring() calls epoll_ctl() after io_uring_setup()
+ */
+#define MAX_DEFERRED_EPOLL_REGS 64
+struct deferred_epoll_reg {
+	unsigned int io_uring_fd;	/* The io_uring fd to add to epoll */
+	unsigned int epoll_fd;		/* The epoll fd */
+	unsigned int events;		/* epoll events mask */
+	unsigned long long data;	/* epoll user data */
+};
+
+static struct {
+	int count;
+	struct deferred_epoll_reg regs[MAX_DEFERRED_EPOLL_REGS];
+} deferred_epoll_io_uring;
+
+/*
+ * Check if a tfd is an io_uring fd (for eventpoll restore).
+ * Called during eventpoll_retore_tfd() to decide whether to defer.
+ */
+int is_io_uring_tfd(struct pstree_item *t, int tfd)
+{
+	MmEntry *mm = rsti(t)->mm;
+	int i;
+
+	if (!mm || !mm->n_io_urings)
+		return 0;
+
+	for (i = 0; i < mm->n_io_urings; i++) {
+		if (mm->io_urings[i]->id == tfd)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Defer an epoll registration for an io_uring fd.
+ * Called from eventpoll_retore_tfd() when tfd is io_uring.
+ */
+int defer_epoll_io_uring(int io_uring_fd, int epoll_fd,
+			 unsigned int events, unsigned long long data)
+{
+	struct deferred_epoll_reg *reg;
+
+	if (deferred_epoll_io_uring.count >= MAX_DEFERRED_EPOLL_REGS) {
+		pr_err("io_uring: Too many deferred epoll registrations\n");
+		return -1;
+	}
+
+	reg = &deferred_epoll_io_uring.regs[deferred_epoll_io_uring.count++];
+	reg->io_uring_fd = io_uring_fd;
+	reg->epoll_fd = epoll_fd;
+	reg->events = events;
+	reg->data = data;
+
+	pr_info("io_uring: Deferred epoll registration: epoll_fd=%d io_uring_fd=%d events=0x%x\n",
+		epoll_fd, io_uring_fd, events);
+	return 0;
+}
+
 static int parse_io_uring_fdinfo(int proc_fd, int fd, struct io_uring_fdinfo *info)
 {
 	char path[64];
@@ -593,6 +661,7 @@ int prepare_io_urings(struct pstree_item *t, struct task_restore_args *ta)
 		ring->sq_ring_size = 0;
 		ring->cq_ring_size = 0;
 		ring->sqe_size = 0;
+		ring->n_epoll_refs = 0;
 
 		/* Extract addresses from captured VMAs */
 		for (j = 0; j < entry->n_vmas; j++) {
@@ -623,9 +692,31 @@ int prepare_io_urings(struct pstree_item *t, struct task_restore_args *ta)
 		ring->sq_thread_idle = entry->has_sq_thread_idle ? entry->sq_thread_idle : 0;
 		ring->fd = entry->id;
 
-		pr_info("Prepared io_uring ring %d: fd=%u sq=%u cq=%u sq_addr=0x%lx sqe_addr=0x%lx\n",
+		/*
+		 * Copy deferred epoll registrations from the global array.
+		 * These were collected during eventpoll_retore_tfd() when it
+		 * detected io_uring tfds and deferred their registration.
+		 */
+		for (j = 0; j < deferred_epoll_io_uring.count; j++) {
+			struct deferred_epoll_reg *reg = &deferred_epoll_io_uring.regs[j];
+			if (reg->io_uring_fd == entry->id) {
+				if (ring->n_epoll_refs >= MAX_EPOLL_REFS_PER_RING) {
+					pr_warn("io_uring fd %u: too many epoll refs\n", entry->id);
+					break;
+				}
+				ring->epoll_refs[ring->n_epoll_refs].epoll_fd = reg->epoll_fd;
+				ring->epoll_refs[ring->n_epoll_refs].events = reg->events;
+				ring->epoll_refs[ring->n_epoll_refs].data = reg->data;
+				ring->n_epoll_refs++;
+
+				pr_info("io_uring fd %u: copied epoll_ref epoll_fd=%u events=0x%x\n",
+					entry->id, reg->epoll_fd, reg->events);
+			}
+		}
+
+		pr_info("Prepared io_uring ring %d: fd=%u sq=%u cq=%u sq_addr=0x%lx sqe_addr=0x%lx n_epoll_refs=%u\n",
 			i, ring->fd, ring->sq_entries, ring->cq_entries,
-			ring->sq_ring_addr, ring->sqe_addr);
+			ring->sq_ring_addr, ring->sqe_addr, ring->n_epoll_refs);
 	}
 
 	pr_info("Prepared %u io_uring ring(s) for restorer\n", ta->io_uring_rings_n);
@@ -809,29 +900,28 @@ int precreate_io_urings(struct pstree_item *t)
 
 	io_uring_groups.count = 0;
 
-	/*
-	 * io_uring FDs and memory mappings are now handled entirely by the
-	 * pie restorer's restore_io_uring_ring() function. This runs INSIDE
-	 * the restored process's address space, which is required for the
-	 * memory mappings to be correct.
-	 *
-	 * Previously we tried to precreate FDs and map memory here, but:
-	 * 1. This runs in CRIU's address space, not the restored process
-	 * 2. Memory mappings here don't transfer to the restored process
-	 * 3. It created duplicate FDs that conflicted with the restorer
-	 *
-	 * Now we just initialize tracking structures and let the restorer
-	 * do all the actual work via prepare_io_urings() + restore_io_uring_ring().
-	 */
 	if (!mm || !mm->n_io_urings) {
 		pr_debug("io_uring: No io_uring entries in MmEntry for pid %d\n", vpid(t));
 		return 0;
 	}
 
-	pr_info("io_uring: Found %zu io_uring(s) - will be restored by pie restorer\n",
+	/*
+	 * io_uring CANNOT be pre-created here. This function runs in CRIU's
+	 * address space, not the target process's. Creating io_uring here
+	 * would put the fd in CRIU's fd table and the mmaps in CRIU's address
+	 * space - neither transfers to the restored process.
+	 *
+	 * The correct approach:
+	 * 1. io_uring is restored by PIE restorer (runs in target process)
+	 * 2. epoll registrations for io_uring tfds are deferred
+	 * 3. PIE calls epoll_ctl() after io_uring_setup()
+	 *
+	 * See prepare_io_urings() for how epoll registrations are collected,
+	 * and restore_io_uring_ring() in pie/restorer.c for the epoll_ctl.
+	 */
+	pr_info("io_uring: Found %zu io_uring(s) - will be restored by PIE restorer\n",
 		mm->n_io_urings);
 
-	/* Nothing to do here - the restorer handles everything */
 	return 0;
 }
 

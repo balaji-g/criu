@@ -30,6 +30,7 @@
 
 #include "protobuf.h"
 #include "images/eventpoll.pb-c.h"
+#include "io_uring.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "epoll: "
@@ -454,20 +455,40 @@ static int eventpoll_retore_tfd(int fd, int id, EventpollTfdEntry *tdefe)
 
 	pr_info_eventpoll_tfd("Restore ", id, tdefe);
 
+	/*
+	 * Check if tfd is an io_uring fd. io_uring is restored LATER in PIE,
+	 * so we defer this registration and let PIE do the epoll_ctl.
+	 */
+	if (is_io_uring_tfd(current, tdefe->tfd)) {
+		pr_info("epoll: Deferring io_uring tfd %d - will be registered by PIE\n",
+			tdefe->tfd);
+		return defer_epoll_io_uring(tdefe->tfd, fd, tdefe->events, tdefe->data);
+	}
+
 	event.events = tdefe->events;
 	event.data.u64 = tdefe->data;
 	if (epoll_ctl(fd, EPOLL_CTL_ADD, tdefe->tfd, &event)) {
+		int err = errno;
 		/*
-		 * When using --skip-mnt-ns for container migration,
-		 * some fds (like sockets) may have been removed from
-		 * the checkpoint. Skip epoll errors for these cases -
-		 * the application will recreate watchers as needed.
+		 * epoll_ctl can fail for several reasons:
+		 * - EBADF: target fd doesn't exist (socket was skipped)
+		 * - ENOENT: tfd not valid (shouldn't happen)
+		 * - EEXIST: already registered (shouldn't happen in restore)
 		 */
-		if (opts.skip_mnt_ns) {
-			pr_warn("Skipping epoll event on %#08x tfd %d (--skip-mnt-ns)\n",
-				id, tdefe->tfd);
+		if (err == EBADF && opts.skip_mnt_ns) {
+			pr_warn("epoll: Skipping tfd %d - fd doesn't exist (socket skipped?)\n",
+				tdefe->tfd);
 			return 0;
 		}
+
+		pr_err("epoll_ctl(EPOLL_CTL_ADD, tfd=%d) failed: %d (%s)\n",
+		       tdefe->tfd, err, strerror(err));
+
+		if (opts.skip_mnt_ns) {
+			pr_warn("  Continuing despite error (--skip-mnt-ns)\n");
+			return 0;
+		}
+
 		pr_perror("Can't add event on %#08x", id);
 		return -1;
 	}
