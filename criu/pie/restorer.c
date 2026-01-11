@@ -860,6 +860,13 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 	int flags = vma_entry->flags | MAP_FIXED;
 	unsigned long addr;
 
+	/*
+	 * io_uring VMAs are already mapped in precreate_io_urings().
+	 * Skip them here to avoid overwriting the io_uring ring buffers.
+	 */
+	if (vma_entry_is(vma_entry, VMA_AREA_IOURING))
+		return vma_entry->start;
+
 	if (vma_entry_is(vma_entry, VMA_AREA_SYSVIPC)) {
 		int att_flags;
 		void *shmaddr = decode_pointer(vma_entry->start);
@@ -1134,7 +1141,14 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	unsigned long sq_ring_size, cq_ring_size, sqe_size;
 	int single_mmap;
 
-	pr_info("Restoring io_uring ring: fd=%u sq=%u cq=%u sq_addr=0x%lx sq_size=%lu sqe_addr=0x%lx sqe_size=%lu\n",
+	pr_info("io_uring: restore_io_uring_ring called, ring ptr=%p\n", ring);
+
+	if (!ring) {
+		pr_err("io_uring: ring pointer is NULL!\n");
+		return -1;
+	}
+
+	pr_info("io_uring: Restoring ring: fd=%u sq=%u cq=%u sq_addr=0x%lx sq_size=%lu sqe_addr=0x%lx sqe_size=%lu\n",
 		ring->fd, ring->sq_entries, ring->cq_entries,
 		ring->sq_ring_addr, ring->sq_ring_size,
 		ring->sqe_addr, ring->sqe_size);
@@ -2276,6 +2290,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * Restore io_uring rings
 	 */
+	pr_info("io_uring: About to restore %u io_uring ring(s)\n", args->io_uring_rings_n);
 	for (i = 0; i < args->io_uring_rings_n; i++)
 		if (restore_io_uring_ring(&args->io_uring_rings[i]) < 0)
 			goto core_restore_end;

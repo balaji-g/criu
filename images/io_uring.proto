@@ -16,6 +16,16 @@ message io_uring_file_entry {
 	required uint64 ino		= 2;	/* Inode number (unique per ring) */
 }
 
+/* VMA mapping for io_uring - stores individual mmap() regions */
+message io_uring_vma {
+	required uint64 addr		= 1 [(criu).hex = true];	/* VMA start address */
+	required uint64 size		= 2;				/* VMA size in bytes */
+	required uint64 pgoff		= 3 [(criu).hex = true];	/* Page offset (determines type) */
+	/* pgoff = 0x0        -> SQ/CQ ring (IORING_OFF_SQ_RING / IORING_OFF_CQ_RING) */
+	/* pgoff = 0x8000000  -> CQ ring only (IORING_OFF_CQ_RING, if separate) */
+	/* pgoff = 0x10000000 -> SQEs (IORING_OFF_SQES) */
+}
+
 message io_uring_entry {
 	required uint32 id		= 1;	/* File descriptor number */
 	required uint64 ino		= 2;	/* Inode number */
@@ -44,7 +54,7 @@ message io_uring_entry {
 	required uint32 sqes		= 30;	/* Pending SQEs */
 	required uint32 cqes		= 31;	/* Pending CQEs */
 
-	/* Memory mapping addresses */
+	/* Memory mapping addresses (legacy single-VMA, kept for compatibility) */
 	required uint64 sq_ring_addr	= 40 [(criu).hex = true];
 	required uint64 cq_ring_addr	= 41 [(criu).hex = true];
 	required uint64 sqe_addr	= 42 [(criu).hex = true];
@@ -53,8 +63,32 @@ message io_uring_entry {
 	required uint64 cq_ring_size	= 44;
 	required uint64 sqe_size	= 45;
 
+	/* Multiple VMA mappings (uvloop creates multiple mmap()s on same ring fd) */
+	repeated io_uring_vma vmas	= 60;
+
 	/* Registered resources */
 	optional uint32 user_files	= 50;	/* Number of registered files */
 	optional uint32 user_bufs	= 51;	/* Number of registered buffers */
+
+	/* Kernel-returned offsets (from io_uring_params after setup) */
+	/* CRITICAL: These must match between dump and restore for uvloop to work */
+	/* sq_off: offsets within SQ ring mmap */
+	optional uint32 sq_off_head		= 70;
+	optional uint32 sq_off_tail		= 71;
+	optional uint32 sq_off_ring_mask	= 72;
+	optional uint32 sq_off_ring_entries	= 73;
+	optional uint32 sq_off_flags		= 74;
+	optional uint32 sq_off_dropped		= 75;
+	optional uint32 sq_off_array		= 76;
+	/* cq_off: offsets within CQ ring mmap */
+	optional uint32 cq_off_head		= 80;
+	optional uint32 cq_off_tail		= 81;
+	optional uint32 cq_off_ring_mask	= 82;
+	optional uint32 cq_off_ring_entries	= 83;
+	optional uint32 cq_off_overflow		= 84;
+	optional uint32 cq_off_cqes		= 85;
+	optional uint32 cq_off_flags		= 86;
+	/* Kernel features */
+	optional uint32 features		= 90;
 }
 

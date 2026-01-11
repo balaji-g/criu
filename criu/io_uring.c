@@ -220,6 +220,59 @@ static int find_io_uring_fd(pid_t pid, unsigned long ino, int *found_fd)
 	return 0;
 }
 
+/*
+ * Helper to count VMAs for a specific io_uring inode
+ */
+static int count_vmas_for_ino(struct vm_area_list *vmas, unsigned long ino)
+{
+	struct vma_area *vma;
+	int count = 0;
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		if (!vma_entry_is(vma->e, VMA_AREA_IOURING))
+			continue;
+		if (vma->vm_iouring_ino == ino)
+			count++;
+	}
+	return count;
+}
+
+/*
+ * Helper to add a VMA to the entry's vmas array
+ */
+static int add_vma_to_entry(IoUringEntry *entry, struct vma_area *vma, int *vma_idx)
+{
+	IoUringVma *v;
+
+	if (*vma_idx >= entry->n_vmas) {
+		pr_err("VMA index %d exceeds allocated count %zu\n", *vma_idx, entry->n_vmas);
+		return -1;
+	}
+
+	v = xmalloc(sizeof(*v));
+	if (!v)
+		return -1;
+
+	io_uring_vma__init(v);
+	v->addr = vma->e->start;
+	v->size = vma->e->end - vma->e->start;
+	v->pgoff = vma->e->pgoff;
+
+	entry->vmas[*vma_idx] = v;
+	(*vma_idx)++;
+
+	pr_info("  VMA %d: addr=0x%lx size=%lu pgoff=0x%lx (%s)\n",
+		*vma_idx,
+		(unsigned long)v->addr,
+		(unsigned long)v->size,
+		(unsigned long)v->pgoff,
+		v->pgoff == IORING_OFF_SQ_RING ? "SQ/CQ ring" :
+		v->pgoff == IORING_OFF_CQ_RING ? "CQ ring" :
+		v->pgoff == IORING_OFF_SQES ? "SQEs" : "unknown");
+
+	return 0;
+}
+
 int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 {
 	struct vma_area *vma;
@@ -229,17 +282,19 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 	int nr = 0;
 	int ret = -1;
 	int proc_fd;
+	int vma_idx = 0;
 
 	if (!vmas->nr_iourings) {
 		pr_debug("No io_uring VMAs to dump\n");
 		return 0;
 	}
 
-	pr_info("Dumping %u io_uring ring(s)\n", vmas->nr_iourings);
+	pr_info("Dumping %u io_uring VMA(s)\n", vmas->nr_iourings);
 
 	proc_fd = open_proc(pid, ".");
 	if (proc_fd < 0) return -1;
 
+	/* Allocate space for entries (one per unique inode, not per VMA) */
 	mme->io_urings = xmalloc(vmas->nr_iourings * sizeof(IoUringEntry *));
 	if (!mme->io_urings) {
 		close(proc_fd);
@@ -247,32 +302,32 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 	}
 
 	/*
-	 * First pass: collect all VMA addresses per io_uring inode.
-	 * Multiple VMAs share the same inode (SQ ring, CQ ring, SQEs).
+	 * Process VMAs and collect ALL addresses per io_uring inode.
+	 * CRITICAL: uvloop creates MULTIPLE mmap()s on the same ring fd,
+	 * so we must capture and restore ALL of them.
 	 */
 	list_for_each_entry(vma, &vmas->h, list) {
 		int fd;
 
-		if (!vma_entry_is(vma->e, VMA_AREA_IOURING)) continue;
+		if (!vma_entry_is(vma->e, VMA_AREA_IOURING))
+			continue;
 
 		/* Check if this VMA belongs to an existing entry */
 		if (vma->vm_iouring_ino == last_ino && entry != NULL) {
-			/* Update existing entry with this VMA's address */
+			/* Add VMA to existing entry's vmas array */
+			if (add_vma_to_entry(entry, vma, &vma_idx) < 0)
+				goto err;
+
+			/* Also update legacy single-address fields (keep last of each type) */
 			if (vma->e->pgoff == IORING_OFF_SQ_RING) {
 				entry->sq_ring_addr = vma->e->start;
 				entry->sq_ring_size = vma->e->end - vma->e->start;
-				pr_debug("  VMA SQ ring: 0x%lx size %lu\n",
-					(unsigned long)entry->sq_ring_addr, (unsigned long)entry->sq_ring_size);
 			} else if (vma->e->pgoff == IORING_OFF_CQ_RING) {
 				entry->cq_ring_addr = vma->e->start;
 				entry->cq_ring_size = vma->e->end - vma->e->start;
-				pr_debug("  VMA CQ ring: 0x%lx size %lu\n",
-					(unsigned long)entry->cq_ring_addr, (unsigned long)entry->cq_ring_size);
 			} else if (vma->e->pgoff == IORING_OFF_SQES) {
 				entry->sqe_addr = vma->e->start;
 				entry->sqe_size = vma->e->end - vma->e->start;
-				pr_debug("  VMA SQEs: 0x%lx size %lu\n",
-					(unsigned long)entry->sqe_addr, (unsigned long)entry->sqe_size);
 			}
 			continue;
 		}
@@ -281,6 +336,25 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		if (entry != NULL) {
 			IoUringFileEntry iufe = IO_URING_FILE_ENTRY__INIT;
 			FileEntry fe = FILE_ENTRY__INIT;
+
+			/* Compute sq_entries/cq_entries from VMA sizes */
+			if (entry->sqe_size > 0) {
+				entry->sq_entries = entry->sqe_size / 64;
+				if (entry->sq_entries == 0)
+					entry->sq_entries = 1;
+			} else {
+				size_t sqe_size = 0;
+				size_t k;
+				for (k = 0; k < entry->n_vmas; k++) {
+					if (entry->vmas[k]->pgoff == IORING_OFF_SQES && entry->vmas[k]->size > sqe_size)
+						sqe_size = entry->vmas[k]->size;
+				}
+				entry->sq_entries = sqe_size > 0 ? sqe_size / 64 : 32;
+			}
+			if (entry->cq_entries == 0)
+				entry->cq_entries = entry->sq_entries * 2;
+			entry->sq_mask = entry->sq_entries - 1;
+			entry->cq_mask = entry->cq_entries - 1;
 
 			mme->io_urings[nr++] = entry;
 
@@ -295,11 +369,8 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 				goto err;
 			}
 
-			pr_info("Dumped io_uring fd %d: SQ=%u CQ=%u sq_addr=0x%lx cq_addr=0x%lx sqe_addr=0x%lx\n",
-				entry->id, entry->sq_entries, entry->cq_entries,
-				(unsigned long)entry->sq_ring_addr,
-				(unsigned long)entry->cq_ring_addr,
-				(unsigned long)entry->sqe_addr);
+			pr_info("Dumped io_uring fd %d: SQ=%u CQ=%u n_vmas=%zu (computed from VMA sizes)\n",
+				entry->id, entry->sq_entries, entry->cq_entries, entry->n_vmas);
 		}
 
 		/* Create new entry for this io_uring */
@@ -325,8 +396,14 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		io_uring_entry__init(entry);
 		entry->id = fd;
 		entry->ino = vma->vm_iouring_ino;
-		entry->sq_entries = fdinfo.sq_mask + 1;
-		entry->cq_entries = fdinfo.cq_mask + 1;
+		/*
+		 * Note: The kernel's io_uring fdinfo doesn't expose SqMask/CqMask.
+		 * We compute sq_entries from the SQEs VMA size: size / 64 bytes per SQE.
+		 * We'll update these values after processing all VMAs for this io_uring.
+		 * For now, set them to 0 as placeholder.
+		 */
+		entry->sq_entries = 0;
+		entry->cq_entries = 0;
 		entry->flags = 0;
 
 #define IORING_SETUP_SQPOLL (1U << 1)
@@ -354,7 +431,7 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		entry->user_bufs = fdinfo.user_bufs;
 		entry->has_user_bufs = true;
 
-		/* Initialize addresses to 0, they'll be filled by this and subsequent VMAs */
+		/* Initialize legacy addresses to 0 */
 		entry->sq_ring_addr = 0;
 		entry->sq_ring_size = 0;
 		entry->cq_ring_addr = 0;
@@ -362,22 +439,29 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		entry->sqe_addr = 0;
 		entry->sqe_size = 0;
 
-		/* Set address from this VMA */
+		/* Allocate vmas array for ALL VMAs belonging to this inode */
+		entry->n_vmas = count_vmas_for_ino(vmas, vma->vm_iouring_ino);
+		entry->vmas = xmalloc(entry->n_vmas * sizeof(IoUringVma *));
+		if (!entry->vmas) goto err;
+		vma_idx = 0;
+
+		pr_info("io_uring fd %d (ino %lu): allocating %zu VMAs\n",
+			fd, vma->vm_iouring_ino, entry->n_vmas);
+
+		/* Add this first VMA to the array */
+		if (add_vma_to_entry(entry, vma, &vma_idx) < 0)
+			goto err;
+
+		/* Set legacy single-address fields from this VMA */
 		if (vma->e->pgoff == IORING_OFF_SQ_RING) {
 			entry->sq_ring_addr = vma->e->start;
 			entry->sq_ring_size = vma->e->end - vma->e->start;
-			pr_debug("  VMA SQ ring: 0x%lx size %lu\n",
-				(unsigned long)entry->sq_ring_addr, (unsigned long)entry->sq_ring_size);
 		} else if (vma->e->pgoff == IORING_OFF_CQ_RING) {
 			entry->cq_ring_addr = vma->e->start;
 			entry->cq_ring_size = vma->e->end - vma->e->start;
-			pr_debug("  VMA CQ ring: 0x%lx size %lu\n",
-				(unsigned long)entry->cq_ring_addr, (unsigned long)entry->cq_ring_size);
 		} else if (vma->e->pgoff == IORING_OFF_SQES) {
 			entry->sqe_addr = vma->e->start;
 			entry->sqe_size = vma->e->end - vma->e->start;
-			pr_debug("  VMA SQEs: 0x%lx size %lu\n",
-				(unsigned long)entry->sqe_addr, (unsigned long)entry->sqe_size);
 		}
 
 		last_ino = vma->vm_iouring_ino;
@@ -387,6 +471,32 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 	if (entry != NULL) {
 		IoUringFileEntry iufe = IO_URING_FILE_ENTRY__INIT;
 		FileEntry fe = FILE_ENTRY__INIT;
+
+		/*
+		 * Compute sq_entries and cq_entries from VMA sizes.
+		 * SQEs VMA size = sq_entries * 64 bytes (sizeof(struct io_uring_sqe))
+		 * The kernel's fdinfo doesn't expose these values, so we derive them.
+		 */
+		if (entry->sqe_size > 0) {
+			entry->sq_entries = entry->sqe_size / 64;
+			if (entry->sq_entries == 0)
+				entry->sq_entries = 1;
+		} else {
+			/* Try to find SQEs from vmas array */
+			size_t sqe_size = 0;
+			size_t k;
+			for (k = 0; k < entry->n_vmas; k++) {
+				if (entry->vmas[k]->pgoff == IORING_OFF_SQES && entry->vmas[k]->size > sqe_size)
+					sqe_size = entry->vmas[k]->size;
+			}
+			entry->sq_entries = sqe_size > 0 ? sqe_size / 64 : 32;
+		}
+		/* CQ entries are typically 2x SQ entries, use same value as fallback */
+		if (entry->cq_entries == 0)
+			entry->cq_entries = entry->sq_entries * 2;
+		/* Update sq_mask/cq_mask for consistency */
+		entry->sq_mask = entry->sq_entries - 1;
+		entry->cq_mask = entry->cq_entries - 1;
 
 		mme->io_urings[nr++] = entry;
 
@@ -401,11 +511,8 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 			goto err;
 		}
 
-		pr_info("Dumped io_uring fd %d: SQ=%u CQ=%u sq_addr=0x%lx cq_addr=0x%lx sqe_addr=0x%lx\n",
-			entry->id, entry->sq_entries, entry->cq_entries,
-			(unsigned long)entry->sq_ring_addr,
-			(unsigned long)entry->cq_ring_addr,
-			(unsigned long)entry->sqe_addr);
+		pr_info("Dumped io_uring fd %d: SQ=%u CQ=%u n_vmas=%zu (computed from VMA sizes)\n",
+			entry->id, entry->sq_entries, entry->cq_entries, entry->n_vmas);
 	}
 
 	mme->n_io_urings = nr;
@@ -417,10 +524,20 @@ err:
 
 void free_io_urings(MmEntry *mme)
 {
-	int i;
+	int i, j;
 	if (mme->io_urings) {
-		for (i = 0; i < mme->n_io_urings; i++)
-			xfree(mme->io_urings[i]);
+		for (i = 0; i < mme->n_io_urings; i++) {
+			IoUringEntry *e = mme->io_urings[i];
+			if (e) {
+				/* Free the vmas array */
+				if (e->vmas) {
+					for (j = 0; j < e->n_vmas; j++)
+						xfree(e->vmas[j]);
+					xfree(e->vmas);
+				}
+				xfree(e);
+			}
+		}
 		xfree(mme->io_urings);
 	}
 }
@@ -439,8 +556,8 @@ int check_io_uring_support(void)
 
 int prepare_io_urings(struct pstree_item *t, struct task_restore_args *ta)
 {
-	int i;
 	MmEntry *mm = rsti(t)->mm;
+	int i, j;
 
 	if (!mm || !mm->n_io_urings) {
 		ta->io_uring_rings = NULL;
@@ -448,33 +565,70 @@ int prepare_io_urings(struct pstree_item *t, struct task_restore_args *ta)
 		return 0;
 	}
 
-	pr_info("Preparing %zu io_uring ring(s) for restore\n", mm->n_io_urings);
-
+	/*
+	 * Allocate ring info structures for the pie restorer.
+	 * The restorer will create fresh io_uring instances and mmap
+	 * them at the target addresses (captured during dump).
+	 *
+	 * Use rst_mem_align_cpos() like aio.c does to get aligned base pointer,
+	 * then allocate each ring entry individually.
+	 */
 	ta->io_uring_rings = (struct rst_io_uring_ring *)rst_mem_align_cpos(RM_PRIVATE);
 	ta->io_uring_rings_n = mm->n_io_urings;
 
 	for (i = 0; i < mm->n_io_urings; i++) {
+		IoUringEntry *entry = mm->io_urings[i];
 		struct rst_io_uring_ring *ring;
-		IoUringEntry *e = mm->io_urings[i];
 
 		ring = rst_mem_alloc(sizeof(*ring), RM_PRIVATE);
-		if (!ring) return -1;
+		if (!ring) {
+			pr_err("Failed to allocate io_uring ring info\n");
+			return -1;
+		}
 
-		ring->sq_ring_addr = e->sq_ring_addr;
-		ring->cq_ring_addr = e->cq_ring_addr;
-		ring->sqe_addr = e->sqe_addr;
-		ring->sq_ring_size = e->sq_ring_size;
-		ring->cq_ring_size = e->cq_ring_size;
-		ring->sqe_size = e->sqe_size;
-		ring->sq_entries = e->sq_entries;
-		ring->cq_entries = e->cq_entries;
-		ring->flags = e->flags;
-		ring->sq_thread_cpu = e->has_sq_thread_cpu ? e->sq_thread_cpu : -1;
-		ring->sq_thread_idle = e->has_sq_thread_idle ? e->sq_thread_idle : 0;
-		ring->fd = e->id;
+		/* Initialize with defaults */
+		ring->sq_ring_addr = 0;
+		ring->cq_ring_addr = 0;
+		ring->sqe_addr = 0;
+		ring->sq_ring_size = 0;
+		ring->cq_ring_size = 0;
+		ring->sqe_size = 0;
 
-		pr_info("  Ring %d: fd=%u sq=%u cq=%u\n", i, ring->fd, ring->sq_entries, ring->cq_entries);
+		/* Extract addresses from captured VMAs */
+		for (j = 0; j < entry->n_vmas; j++) {
+			IoUringVma *v = entry->vmas[j];
+			if (v->pgoff == IORING_OFF_SQ_RING || v->pgoff == 0) {
+				/* Take lowest address for SQ ring (primary) */
+				if (!ring->sq_ring_addr || v->addr < ring->sq_ring_addr) {
+					ring->sq_ring_addr = v->addr;
+					ring->sq_ring_size = v->size;
+				}
+			} else if (v->pgoff == IORING_OFF_CQ_RING) {
+				if (!ring->cq_ring_addr || v->addr < ring->cq_ring_addr) {
+					ring->cq_ring_addr = v->addr;
+					ring->cq_ring_size = v->size;
+				}
+			} else if (v->pgoff == IORING_OFF_SQES) {
+				if (!ring->sqe_addr || v->addr < ring->sqe_addr) {
+					ring->sqe_addr = v->addr;
+					ring->sqe_size = v->size;
+				}
+			}
+		}
+
+		ring->sq_entries = entry->sq_entries;
+		ring->cq_entries = entry->cq_entries;
+		ring->flags = entry->flags;
+		ring->sq_thread_cpu = entry->has_sq_thread_cpu ? entry->sq_thread_cpu : -1;
+		ring->sq_thread_idle = entry->has_sq_thread_idle ? entry->sq_thread_idle : 0;
+		ring->fd = entry->id;
+
+		pr_info("Prepared io_uring ring %d: fd=%u sq=%u cq=%u sq_addr=0x%lx sqe_addr=0x%lx\n",
+			i, ring->fd, ring->sq_entries, ring->cq_entries,
+			ring->sq_ring_addr, ring->sqe_addr);
 	}
+
+	pr_info("Prepared %u io_uring ring(s) for restorer\n", ta->io_uring_rings_n);
 	return 0;
 }
 
@@ -652,170 +806,458 @@ const struct fdtype_ops io_uring_dump_ops = {
 int precreate_io_urings(struct pstree_item *t)
 {
 	MmEntry *mm = rsti(t)->mm;
-	int i;
 
 	io_uring_groups.count = 0;
 
+	/*
+	 * io_uring FDs and memory mappings are now handled entirely by the
+	 * pie restorer's restore_io_uring_ring() function. This runs INSIDE
+	 * the restored process's address space, which is required for the
+	 * memory mappings to be correct.
+	 *
+	 * Previously we tried to precreate FDs and map memory here, but:
+	 * 1. This runs in CRIU's address space, not the restored process
+	 * 2. Memory mappings here don't transfer to the restored process
+	 * 3. It created duplicate FDs that conflicted with the restorer
+	 *
+	 * Now we just initialize tracking structures and let the restorer
+	 * do all the actual work via prepare_io_urings() + restore_io_uring_ring().
+	 */
 	if (!mm || !mm->n_io_urings) {
-		pr_debug("No io_uring entries in MmEntry for pid %d\n", vpid(t));
+		pr_debug("io_uring: No io_uring entries in MmEntry for pid %d\n", vpid(t));
 		return 0;
 	}
 
-	pr_info("Pre-creating %d io_uring(s) from MmEntry\n", (int)mm->n_io_urings);
+	pr_info("io_uring: Found %zu io_uring(s) - will be restored by pie restorer\n",
+		mm->n_io_urings);
 
-	for (i = 0; i < mm->n_io_urings; i++) {
-		IoUringEntry *entry = mm->io_urings[i];
-		struct io_uring_params params = { 0 };
-		int ring_fd;
-		void *ptr;
-		size_t sq_ring_sz, cq_ring_sz, sqes_sz;
+	/* Nothing to do here - the restorer handles everything */
+	return 0;
+}
 
-		/* CRITICAL: Never touch fd 0/1/2 */
-		if (entry->id < 3) {
-			pr_err("BUG: io_uring fd %d < 3!\n", entry->id);
-			BUG();
-		}
-
-		params.sq_entries = entry->sq_entries;
-		params.cq_entries = entry->cq_entries;
-		params.flags = entry->flags;
-
-		if (entry->has_sq_thread_cpu && entry->sq_thread_cpu >= 0)
-			params.sq_thread_cpu = entry->sq_thread_cpu;
-		if (entry->has_sq_thread_idle)
-			params.sq_thread_idle = entry->sq_thread_idle;
-
-		/* Create the io_uring with identical parameters */
-		ring_fd = syscall(__NR_io_uring_setup, params.sq_entries, &params);
-		if (ring_fd < 0) {
-			pr_perror("Failed to create io_uring for fd %d", entry->id);
-			return -1;
-		}
-
-		pr_info("Created io_uring fd %d (target fd %d, ino %lu)\n",
-			ring_fd, entry->id, (unsigned long)entry->ino);
-		pr_info("  Kernel returned: sq_entries=%u cq_entries=%u features=0x%x\n",
-			params.sq_entries, params.cq_entries, params.features);
+/* DISABLED: Old precreate code removed - keeping for reference
+ * The pie restorer's restore_io_uring_ring() now handles:
+ * - io_uring_setup() to create new ring
+ * - mmap() with MAP_FIXED to target addresses
+ * - dup2() to move fd to target number
+ */
+#if 0
+static void __attribute__((unused)) old_precreate_code(void)
+{
+	/* This code ran in CRIU's address space, not the restored process.
+	 * Memory mappings created here didn't transfer to the restored process,
+	 * causing segfaults when uvloop tried to access the unmapped addresses.
+	 */
 
 		/*
-		 * CRITICAL: Map ring memory to the EXACT original addresses!
-		 * uvloop/liburing have cached pointers to these addresses.
-		 * Without MAP_FIXED to original addresses, uvloop will segfault.
-		 *
-		 * Compute sizes from kernel-returned offsets (more robust than saved sizes)
+		 * CRITICAL: Log sq_off and cq_off for layout comparison.
+		 * uvloop caches pointers like: sq->array = ring_base + sq_off.array
+		 * If offsets differ between dump and restore, uvloop will crash.
 		 */
+		pr_info("  sq_off: head=%u tail=%u ring_mask=%u ring_entries=%u flags=%u dropped=%u array=%u\n",
+			params.sq_off.head, params.sq_off.tail, params.sq_off.ring_mask,
+			params.sq_off.ring_entries, params.sq_off.flags, params.sq_off.dropped,
+			params.sq_off.array);
+		pr_info("  cq_off: head=%u tail=%u ring_mask=%u ring_entries=%u overflow=%u cqes=%u flags=%u\n",
+			params.cq_off.head, params.cq_off.tail, params.cq_off.ring_mask,
+			params.cq_off.ring_entries, params.cq_off.overflow, params.cq_off.cqes,
+			params.cq_off.flags);
 
-		/* SQ ring size: includes sq_off.array + sq_entries * sizeof(u32) */
+		/*
+		 * Check if saved offsets exist and compare
+		 */
+		if (entry->has_sq_off_array) {
+			pr_info("  Comparing with saved offsets:\n");
+			pr_info("    sq_off.array: saved=%u restored=%u %s\n",
+				entry->sq_off_array, params.sq_off.array,
+				entry->sq_off_array == params.sq_off.array ? "MATCH" : "MISMATCH!");
+			pr_info("    cq_off.cqes: saved=%u restored=%u %s\n",
+				entry->cq_off_cqes, params.cq_off.cqes,
+				entry->cq_off_cqes == params.cq_off.cqes ? "MATCH" : "MISMATCH!");
+
+			if (entry->sq_off_array != params.sq_off.array ||
+			    entry->cq_off_cqes != params.cq_off.cqes) {
+				pr_err("LAYOUT MISMATCH! Ring offsets differ - uvloop will crash!\n");
+				pr_err("  This usually means kernel version/config differs between checkpoint and restore.\n");
+			}
+		} else {
+			pr_warn("  No saved offsets to compare (checkpoint from older agent version)\n");
+		}
+
+		/*
+		 * Compute sizes from kernel-returned offsets (for validation)
+		 */
 		sq_ring_sz = params.sq_off.array + params.sq_entries * sizeof(__u32);
-		/* Round up to page size */
 		sq_ring_sz = (sq_ring_sz + 4095) & ~4095UL;
 
-		/* CQ ring size: cq_off.cqes + cq_entries * sizeof(struct io_uring_cqe) */
-		cq_ring_sz = params.cq_off.cqes + params.cq_entries * 16; /* cqe is 16 bytes */
+		cq_ring_sz = params.cq_off.cqes + params.cq_entries * 16;
 		cq_ring_sz = (cq_ring_sz + 4095) & ~4095UL;
 
-		/* SQEs size */
-		sqes_sz = params.sq_entries * 64; /* sqe is 64 bytes */
+		sqes_sz = params.sq_entries * 64;
 		sqes_sz = (sqes_sz + 4095) & ~4095UL;
 
-		/* Validate against saved sizes */
-		if (entry->sq_ring_size > 0 && sq_ring_sz > entry->sq_ring_size) {
-			pr_warn("SQ ring size mismatch: kernel needs %zu, saved %lu\n",
-				sq_ring_sz, (unsigned long)entry->sq_ring_size);
+		/*
+		 * Map VMAs from the vmas array using mmap + mremap strategy.
+		 *
+		 * uvloop creates duplicate VMAs with the same pgoff via mremap(DONTUNMAP).
+		 * The kernel rejects multiple mmap() calls for the same io_uring offset.
+		 *
+		 * Strategy (per friend's guidance):
+		 * 1. Group VMAs by pgoff
+		 * 2. mmap() only ONCE per pgoff (primary = lowest address)
+		 * 3. Use mremap(MREMAP_DONTUNMAP) to create duplicates at other addresses
+		 */
+		if (entry->n_vmas > 0 && entry->vmas) {
+			/* Track which pgoff values we've already mapped */
+			int sq_ring_mapped = 0, cq_ring_mapped = 0, sqes_mapped = 0;
+			/* Track which pgoff types we've seen (for finding primary) */
+			int sq_ring_seen = 0, cq_ring_seen = 0, sqes_seen = 0;
+			void *sq_ring_primary = NULL, *cq_ring_primary = NULL, *sqes_primary = NULL;
+			size_t sq_ring_primary_sz = 0, cq_ring_primary_sz = 0, sqes_primary_sz = 0;
+
+			pr_info("  Mapping %zu VMAs (mmap + mremap strategy)\n", entry->n_vmas);
+
+			/*
+			 * First pass: find primary (lowest addr) for each pgoff group
+			 * and determine max size needed
+			 */
+			for (j = 0; j < entry->n_vmas; j++) {
+				IoUringVma *v = entry->vmas[j];
+
+				if (v->pgoff == IORING_OFF_SQ_RING || v->pgoff == 0) {
+					if (!sq_ring_seen || v->addr < (uint64_t)sq_ring_primary) {
+						sq_ring_primary = (void *)v->addr;
+					}
+					sq_ring_seen = 1;
+					if (v->size > sq_ring_primary_sz)
+						sq_ring_primary_sz = v->size;
+				} else if (v->pgoff == IORING_OFF_CQ_RING) {
+					if (!cq_ring_seen || v->addr < (uint64_t)cq_ring_primary) {
+						cq_ring_primary = (void *)v->addr;
+					}
+					cq_ring_seen = 1;
+					if (v->size > cq_ring_primary_sz)
+						cq_ring_primary_sz = v->size;
+				} else if (v->pgoff == IORING_OFF_SQES) {
+					if (!sqes_seen || v->addr < (uint64_t)sqes_primary) {
+						sqes_primary = (void *)v->addr;
+					}
+					sqes_seen = 1;
+					if (v->size > sqes_primary_sz)
+						sqes_primary_sz = v->size;
+				}
+			}
+
+			/*
+			 * CRITICAL: Use kernel-computed sizes for mmap, not saved VMA sizes.
+			 * The kernel will reject mmap requests larger than what it allocated.
+			 * If saved sizes are larger (from original process), use kernel sizes.
+			 */
+			sq_ring_primary_sz = sq_ring_sz;
+			cq_ring_primary_sz = cq_ring_sz;
+			sqes_primary_sz = sqes_sz;
+
+			pr_info("  Using kernel sizes: sq_ring=%zu cq_ring=%zu sqes=%zu\n",
+				sq_ring_sz, cq_ring_sz, sqes_sz);
+
+			/* Log selected primaries */
+			if (sq_ring_seen)
+				pr_info("  SQ/CQ ring PRIMARY: 0x%lx (size %zu)\n",
+					(unsigned long)sq_ring_primary, sq_ring_primary_sz);
+			if (cq_ring_seen)
+				pr_info("  CQ ring PRIMARY: 0x%lx (size %zu)\n",
+					(unsigned long)cq_ring_primary, cq_ring_primary_sz);
+			if (sqes_seen)
+				pr_info("  SQEs PRIMARY: 0x%lx (size %zu)\n",
+					(unsigned long)sqes_primary, sqes_primary_sz);
+
+			/*
+			 * Second pass: mmap primary VMAs first, then mremap duplicates
+			 */
+			for (j = 0; j < entry->n_vmas; j++) {
+				IoUringVma *v = entry->vmas[j];
+				off_t offset;
+				size_t primary_sz;
+				void **primary_ptr;
+				int *mapped_flag;
+				const char *type_str;
+
+				/* Determine offset and type from pgoff */
+				if (v->pgoff == IORING_OFF_SQ_RING || v->pgoff == 0) {
+					offset = IORING_OFF_SQ_RING;
+					primary_sz = sq_ring_primary_sz;
+					primary_ptr = &sq_ring_primary;
+					mapped_flag = &sq_ring_mapped;
+					type_str = "SQ/CQ ring";
+				} else if (v->pgoff == IORING_OFF_CQ_RING) {
+					offset = IORING_OFF_CQ_RING;
+					primary_sz = cq_ring_primary_sz;
+					primary_ptr = &cq_ring_primary;
+					mapped_flag = &cq_ring_mapped;
+					type_str = "CQ ring";
+				} else if (v->pgoff == IORING_OFF_SQES) {
+					offset = IORING_OFF_SQES;
+					primary_sz = sqes_primary_sz;
+					primary_ptr = &sqes_primary;
+					mapped_flag = &sqes_mapped;
+					type_str = "SQEs";
+				} else {
+					pr_warn("Unknown io_uring pgoff 0x%lx, skipping\n",
+						(unsigned long)v->pgoff);
+					continue;
+				}
+
+				if (!*mapped_flag) {
+					/*
+					 * Primary mapping strategy:
+					 * 1. mmap WITHOUT MAP_FIXED (let kernel choose address)
+					 * 2. mremap with MREMAP_FIXED to move to target address
+					 *
+					 * This is needed because io_uring's mmap handler may reject
+					 * MAP_FIXED to arbitrary addresses with EINVAL.
+					 */
+					void *kernel_ptr;
+
+					pr_info("  VMA %d: %s PRIMARY - step 1: mmap (kernel addr)\n",
+						j, type_str);
+
+					kernel_ptr = mmap(NULL, primary_sz,
+						   PROT_READ | PROT_WRITE,
+						   MAP_SHARED | MAP_POPULATE,
+						   ring_fd, offset);
+
+					if (kernel_ptr == MAP_FAILED) {
+						pr_perror("Failed to mmap %s (kernel addr)",
+							  type_str);
+						close(ring_fd);
+						return -1;
+					}
+					pr_info("  %s kernel mapped at %p, now relocating to 0x%lx\n",
+						type_str, kernel_ptr, (unsigned long)*primary_ptr);
+
+					/* Now relocate to target address */
+					ptr = mremap(kernel_ptr, primary_sz, primary_sz,
+						     MREMAP_MAYMOVE | MREMAP_FIXED,
+						     *primary_ptr);
+
+					if (ptr == MAP_FAILED) {
+						pr_perror("Failed to mremap %s from %p to 0x%lx",
+							  type_str, kernel_ptr, (unsigned long)*primary_ptr);
+						munmap(kernel_ptr, primary_sz);
+						close(ring_fd);
+						return -1;
+					}
+					if (ptr != *primary_ptr) {
+						pr_err("%s mremap at wrong address: expected %p, got %p\n",
+						       type_str, *primary_ptr, ptr);
+						close(ring_fd);
+						return -1;
+					}
+					*mapped_flag = 1;
+					pr_info("  %s mapped successfully at %p\n", type_str, ptr);
+				}
+
+				/* If this VMA is not the primary, create duplicate mapping */
+				if ((void *)v->addr != *primary_ptr) {
+					void *dup_kernel_ptr;
+
+					/*
+					 * Strategy for duplicate VMAs:
+					 * mremap(DONTUNMAP) doesn't work on io_uring mappings.
+					 * Instead, we do a fresh mmap() on the same ring_fd
+					 * (io_uring allows multiple mmaps) and then mremap
+					 * to the target address.
+					 */
+					pr_info("  VMA %d: %s DUPLICATE - mmap+mremap to 0x%lx\n",
+						j, type_str, (unsigned long)v->addr);
+
+					/* Step 1: Fresh mmap to kernel-chosen address */
+					dup_kernel_ptr = mmap(NULL, primary_sz,
+						   PROT_READ | PROT_WRITE,
+						   MAP_SHARED | MAP_POPULATE,
+						   ring_fd, offset);
+
+					if (dup_kernel_ptr == MAP_FAILED) {
+						pr_warn("Failed to mmap %s for duplicate - skipping\n",
+							type_str);
+						continue;
+					}
+
+					/* Step 2: Relocate to duplicate target address */
+					ptr = mremap(dup_kernel_ptr, primary_sz, primary_sz,
+						     MREMAP_MAYMOVE | MREMAP_FIXED,
+						     (void *)v->addr);
+
+					if (ptr == MAP_FAILED) {
+						pr_warn("Failed to mremap %s to 0x%lx - skipping duplicate\n",
+							type_str, (unsigned long)v->addr);
+						munmap(dup_kernel_ptr, primary_sz);
+						continue;
+					}
+					if (ptr != (void *)v->addr) {
+						pr_err("%s mremap at wrong address: expected 0x%lx, got %p\n",
+						       type_str, (unsigned long)v->addr, ptr);
+						close(ring_fd);
+						return -1;
+					}
+					pr_info("  %s duplicate created at 0x%lx\n",
+						type_str, (unsigned long)v->addr);
+				}
+			}
+
+			/*
+			 * CRITICAL: Sanitize ring state to "empty" after mapping.
+		 *
+		 * The app has cached head/tail values from before checkpoint.
+		 * The kernel's new ring is initialized to 0. We need to make
+		 * the ring consistent - set head=tail=0 so the app sees an
+		 * empty ring and won't try to access stale entries.
+		 *
+		 * Ring structure (from params.sq_off / params.cq_off):
+		 *   head: kernel-updated (SQ) or app-updated (CQ)
+		 *   tail: app-updated (SQ) or kernel-updated (CQ)
+		 *
+		 * Setting head=tail=0 makes the ring appear empty:
+		 *   - No pending submissions (SQ)
+		 *   - No pending completions (CQ)
+		 */
+		if (sq_ring_primary && sq_ring_mapped) {
+			volatile uint32_t *sq_head, *sq_tail, *sq_mask, *sq_flags;
+
+			sq_head = (uint32_t*)((char*)sq_ring_primary + params.sq_off.head);
+			sq_tail = (uint32_t*)((char*)sq_ring_primary + params.sq_off.tail);
+			sq_mask = (uint32_t*)((char*)sq_ring_primary + params.sq_off.ring_mask);
+			sq_flags = (uint32_t*)((char*)sq_ring_primary + params.sq_off.flags);
+
+			pr_info("  SQ ring state before sanitize: head=%u tail=%u mask=%u flags=%u\n",
+				*sq_head, *sq_tail, *sq_mask, *sq_flags);
+
+			/* Set head=tail=0 to make ring empty */
+			*sq_head = 0;
+			*sq_tail = 0;
+
+			pr_info("  SQ ring sanitized: head=0 tail=0\n");
+
+			/* Also sanitize CQ if it shares the same mapping */
+			if (!cq_ring_seen || cq_ring_primary == sq_ring_primary) {
+				volatile uint32_t *cq_head, *cq_tail;
+
+				cq_head = (uint32_t*)((char*)sq_ring_primary + params.cq_off.head);
+				cq_tail = (uint32_t*)((char*)sq_ring_primary + params.cq_off.tail);
+
+				pr_info("  CQ ring (shared) state before sanitize: head=%u tail=%u\n",
+					*cq_head, *cq_tail);
+
+				*cq_head = 0;
+				*cq_tail = 0;
+
+				pr_info("  CQ ring (shared) sanitized: head=0 tail=0\n");
+			}
 		}
-		if (entry->cq_ring_size > 0 && cq_ring_sz > entry->cq_ring_size) {
-			pr_warn("CQ ring size mismatch: kernel needs %zu, saved %lu\n",
-				cq_ring_sz, (unsigned long)entry->cq_ring_size);
-		}
-		if (entry->sqe_size > 0 && sqes_sz > entry->sqe_size) {
-			pr_warn("SQEs size mismatch: kernel needs %zu, saved %lu\n",
-				sqes_sz, (unsigned long)entry->sqe_size);
-		}
 
-		/* Use saved sizes if available and sufficient, otherwise kernel sizes */
-		if (entry->sq_ring_size > 0 && entry->sq_ring_size >= sq_ring_sz)
-			sq_ring_sz = entry->sq_ring_size;
-		if (entry->cq_ring_size > 0 && entry->cq_ring_size >= cq_ring_sz)
-			cq_ring_sz = entry->cq_ring_size;
-		if (entry->sqe_size > 0 && entry->sqe_size >= sqes_sz)
-			sqes_sz = entry->sqe_size;
+		/* Sanitize separate CQ ring if it exists */
+		if (cq_ring_mapped && cq_ring_primary != sq_ring_primary) {
+			volatile uint32_t *cq_head, *cq_tail;
 
-		/* Map SQ ring to original address */
-		if (entry->sq_ring_addr != 0) {
-			pr_info("  Mapping SQ ring: addr=0x%lx size=%zu\n",
-				(unsigned long)entry->sq_ring_addr, sq_ring_sz);
+			cq_head = (uint32_t*)((char*)cq_ring_primary + params.cq_off.head);
+			cq_tail = (uint32_t*)((char*)cq_ring_primary + params.cq_off.tail);
 
-			ptr = mmap((void *)entry->sq_ring_addr, sq_ring_sz,
-				   PROT_READ | PROT_WRITE,
-				   MAP_SHARED | MAP_POPULATE | MAP_FIXED,
-				   ring_fd, IORING_OFF_SQ_RING);
+			pr_info("  CQ ring (separate) state before sanitize: head=%u tail=%u\n",
+				*cq_head, *cq_tail);
 
-			if (ptr == MAP_FAILED) {
-				pr_perror("Failed to mmap SQ ring at 0x%lx",
-					  (unsigned long)entry->sq_ring_addr);
-				close(ring_fd);
-				return -1;
-			}
-			if (ptr != (void *)entry->sq_ring_addr) {
-				pr_err("SQ ring mapped at wrong address: expected 0x%lx, got %p\n",
-				       (unsigned long)entry->sq_ring_addr, ptr);
-				close(ring_fd);
-				return -1;
-			}
-			pr_info("  SQ ring mapped successfully at 0x%lx\n",
-				(unsigned long)entry->sq_ring_addr);
+			*cq_head = 0;
+			*cq_tail = 0;
+
+			pr_info("  CQ ring (separate) sanitized: head=0 tail=0\n");
 		}
 
-		/* Map CQ ring to original address */
-		if (entry->cq_ring_addr != 0) {
-			pr_info("  Mapping CQ ring: addr=0x%lx size=%zu\n",
-				(unsigned long)entry->cq_ring_addr, cq_ring_sz);
+		pr_info("  io_uring %d rings sanitized to empty state\n", entry->id);
+	} else {
+			/*
+			 * Fallback: use legacy single-address fields.
+			 * This handles checkpoints made before the multi-VMA support.
+			 */
+			pr_info("  Using legacy single-address fields\n");
 
-			ptr = mmap((void *)entry->cq_ring_addr, cq_ring_sz,
-				   PROT_READ | PROT_WRITE,
-				   MAP_SHARED | MAP_POPULATE | MAP_FIXED,
-				   ring_fd, IORING_OFF_CQ_RING);
+			/* Use saved sizes if available and sufficient, otherwise kernel sizes */
+			if (entry->sq_ring_size > 0 && entry->sq_ring_size >= sq_ring_sz)
+				sq_ring_sz = entry->sq_ring_size;
+			if (entry->cq_ring_size > 0 && entry->cq_ring_size >= cq_ring_sz)
+				cq_ring_sz = entry->cq_ring_size;
+			if (entry->sqe_size > 0 && entry->sqe_size >= sqes_sz)
+				sqes_sz = entry->sqe_size;
 
-			if (ptr == MAP_FAILED) {
-				pr_perror("Failed to mmap CQ ring at 0x%lx",
-					  (unsigned long)entry->cq_ring_addr);
-				close(ring_fd);
-				return -1;
+			/* Map SQ ring to original address */
+			if (entry->sq_ring_addr != 0) {
+				pr_info("  Mapping SQ ring: addr=0x%lx size=%zu\n",
+					(unsigned long)entry->sq_ring_addr, sq_ring_sz);
+
+				ptr = mmap((void *)entry->sq_ring_addr, sq_ring_sz,
+					   PROT_READ | PROT_WRITE,
+					   MAP_SHARED | MAP_POPULATE | MAP_FIXED,
+					   ring_fd, IORING_OFF_SQ_RING);
+
+				if (ptr == MAP_FAILED) {
+					pr_perror("Failed to mmap SQ ring at 0x%lx",
+						  (unsigned long)entry->sq_ring_addr);
+					close(ring_fd);
+					return -1;
+				}
+				if (ptr != (void *)entry->sq_ring_addr) {
+					pr_err("SQ ring mapped at wrong address: expected 0x%lx, got %p\n",
+					       (unsigned long)entry->sq_ring_addr, ptr);
+					close(ring_fd);
+					return -1;
+				}
 			}
-			if (ptr != (void *)entry->cq_ring_addr) {
-				pr_err("CQ ring mapped at wrong address: expected 0x%lx, got %p\n",
-				       (unsigned long)entry->cq_ring_addr, ptr);
-				close(ring_fd);
-				return -1;
-			}
-			pr_info("  CQ ring mapped successfully at 0x%lx\n",
-				(unsigned long)entry->cq_ring_addr);
-		}
 
-		/* Map SQEs to original address */
-		if (entry->sqe_addr != 0) {
-			pr_info("  Mapping SQEs: addr=0x%lx size=%zu\n",
-				(unsigned long)entry->sqe_addr, sqes_sz);
+			/* Map CQ ring to original address */
+			if (entry->cq_ring_addr != 0) {
+				pr_info("  Mapping CQ ring: addr=0x%lx size=%zu\n",
+					(unsigned long)entry->cq_ring_addr, cq_ring_sz);
 
-			ptr = mmap((void *)entry->sqe_addr, sqes_sz,
-				   PROT_READ | PROT_WRITE,
-				   MAP_SHARED | MAP_POPULATE | MAP_FIXED,
-				   ring_fd, IORING_OFF_SQES);
+				ptr = mmap((void *)entry->cq_ring_addr, cq_ring_sz,
+					   PROT_READ | PROT_WRITE,
+					   MAP_SHARED | MAP_POPULATE | MAP_FIXED,
+					   ring_fd, IORING_OFF_CQ_RING);
 
-			if (ptr == MAP_FAILED) {
-				pr_perror("Failed to mmap SQEs at 0x%lx",
-					  (unsigned long)entry->sqe_addr);
-				close(ring_fd);
-				return -1;
+				if (ptr == MAP_FAILED) {
+					pr_perror("Failed to mmap CQ ring at 0x%lx",
+						  (unsigned long)entry->cq_ring_addr);
+					close(ring_fd);
+					return -1;
+				}
+				if (ptr != (void *)entry->cq_ring_addr) {
+					pr_err("CQ ring mapped at wrong address: expected 0x%lx, got %p\n",
+					       (unsigned long)entry->cq_ring_addr, ptr);
+					close(ring_fd);
+					return -1;
+				}
 			}
-			if (ptr != (void *)entry->sqe_addr) {
-				pr_err("SQEs mapped at wrong address: expected 0x%lx, got %p\n",
-				       (unsigned long)entry->sqe_addr, ptr);
-				close(ring_fd);
-				return -1;
+
+			/* Map SQEs to original address */
+			if (entry->sqe_addr != 0) {
+				pr_info("  Mapping SQEs: addr=0x%lx size=%zu\n",
+					(unsigned long)entry->sqe_addr, sqes_sz);
+
+				ptr = mmap((void *)entry->sqe_addr, sqes_sz,
+					   PROT_READ | PROT_WRITE,
+					   MAP_SHARED | MAP_POPULATE | MAP_FIXED,
+					   ring_fd, IORING_OFF_SQES);
+
+				if (ptr == MAP_FAILED) {
+					pr_perror("Failed to mmap SQEs at 0x%lx",
+						  (unsigned long)entry->sqe_addr);
+					close(ring_fd);
+					return -1;
+				}
+				if (ptr != (void *)entry->sqe_addr) {
+					pr_err("SQEs mapped at wrong address: expected 0x%lx, got %p\n",
+					       (unsigned long)entry->sqe_addr, ptr);
+					close(ring_fd);
+					return -1;
+				}
 			}
-			pr_info("  SQEs mapped successfully at 0x%lx\n",
-				(unsigned long)entry->sqe_addr);
 		}
 
 		/* Move to target fd number */
@@ -831,8 +1273,8 @@ int precreate_io_urings(struct pstree_item *t)
 	}
 
 	pr_info("Pre-created %d io_uring(s) with ring mappings\n", (int)mm->n_io_urings);
-	return 0;
 }
+#endif /* disabled old precreate code */
 
 /* Check if fd is a pre-created io_uring fd based on MmEntry data */
 int is_io_uring_precreated_fd(struct pstree_item *t, int fd)

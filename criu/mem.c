@@ -1087,6 +1087,13 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 		if (vma->e->status & VMA_EXT_PLUGIN)
 			continue;
 
+		/*
+		 * io_uring VMAs are already mapped in precreate_io_urings().
+		 * Skip them here to avoid overwriting with anonymous memory.
+		 */
+		if (vma_entry_is(vma->e, VMA_AREA_IOURING))
+			continue;
+
 		if (vma->pvma == NULL && pr->pieok && !vma_force_premap(vma, &vmas->h)) {
 			/*
 			 * VMA in question is not shared with anyone. We'll
