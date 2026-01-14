@@ -633,6 +633,19 @@ int prepare_io_urings(struct pstree_item *t, struct task_restore_args *ta)
 		return 0;
 	}
 
+	/* Skip io_uring restoration if requested.
+	 * This is useful when io_uring state after restore causes issues
+	 * with applications like uvloop/libuv that maintain internal state.
+	 * The application will either recreate io_uring or fall back to epoll.
+	 */
+	if (opts.skip_io_uring) {
+		pr_warn("Skipping io_uring restoration (--skip-io-uring)\n");
+		pr_warn("  %zu io_uring ring(s) will NOT be restored\n", mm->n_io_urings);
+		ta->io_uring_rings = NULL;
+		ta->io_uring_rings_n = 0;
+		return 0;
+	}
+
 	/*
 	 * Allocate ring info structures for the pie restorer.
 	 * The restorer will create fresh io_uring instances and mmap
@@ -691,6 +704,16 @@ int prepare_io_urings(struct pstree_item *t, struct task_restore_args *ta)
 		ring->sq_thread_cpu = entry->has_sq_thread_cpu ? entry->sq_thread_cpu : -1;
 		ring->sq_thread_idle = entry->has_sq_thread_idle ? entry->sq_thread_idle : 0;
 		ring->fd = entry->id;
+
+		/*
+		 * Copy ring state (head/tail) from checkpoint.
+		 * This is CRITICAL: libuv/uvloop cache these values internally.
+		 * If we don't restore them, there's a mismatch causing crashes.
+		 */
+		ring->sq_head = entry->sq_head;
+		ring->sq_tail = entry->sq_tail;
+		ring->cq_head = entry->cq_head;
+		ring->cq_tail = entry->cq_tail;
 
 		/*
 		 * Copy deferred epoll registrations from the global array.
@@ -1196,72 +1219,84 @@ static void __attribute__((unused)) old_precreate_code(void)
 			}
 
 			/*
-			 * CRITICAL: Sanitize ring state to "empty" after mapping.
+			 * CRITICAL: Restore ring head/tail to checkpointed values.
 		 *
-		 * The app has cached head/tail values from before checkpoint.
-		 * The kernel's new ring is initialized to 0. We need to make
-		 * the ring consistent - set head=tail=0 so the app sees an
-		 * empty ring and won't try to access stale entries.
+		 * The app (libuv/uvloop) caches head/tail values internally.
+		 * The kernel's new ring is initialized to 0. We MUST restore
+		 * the checkpointed head/tail values so the app's internal state
+		 * matches the kernel's ring state.
 		 *
 		 * Ring structure (from params.sq_off / params.cq_off):
 		 *   head: kernel-updated (SQ) or app-updated (CQ)
 		 *   tail: app-updated (SQ) or kernel-updated (CQ)
 		 *
-		 * Setting head=tail=0 makes the ring appear empty:
-		 *   - No pending submissions (SQ)
-		 *   - No pending completions (CQ)
+		 * If we set head=tail=0 (old approach), there's a mismatch:
+		 *   - App thinks tail is at N, kernel says tail is at 0
+		 *   - App tries to submit at index N, kernel expects 0
+		 *   - Result: io_uring_enter() fails, libuv calls abort()
+		 *
+		 * By restoring checkpointed values, the ring state matches
+		 * what the app expects, and operations resume correctly.
 		 */
 		if (sq_ring_primary && sq_ring_mapped) {
-			volatile uint32_t *sq_head, *sq_tail, *sq_mask, *sq_flags;
+			volatile uint32_t *sq_head_ptr, *sq_tail_ptr, *sq_mask, *sq_flags;
 
-			sq_head = (uint32_t*)((char*)sq_ring_primary + params.sq_off.head);
-			sq_tail = (uint32_t*)((char*)sq_ring_primary + params.sq_off.tail);
+			sq_head_ptr = (uint32_t*)((char*)sq_ring_primary + params.sq_off.head);
+			sq_tail_ptr = (uint32_t*)((char*)sq_ring_primary + params.sq_off.tail);
 			sq_mask = (uint32_t*)((char*)sq_ring_primary + params.sq_off.ring_mask);
 			sq_flags = (uint32_t*)((char*)sq_ring_primary + params.sq_off.flags);
 
-			pr_info("  SQ ring state before sanitize: head=%u tail=%u mask=%u flags=%u\n",
-				*sq_head, *sq_tail, *sq_mask, *sq_flags);
+			pr_info("  SQ ring state before restore: kernel_head=%u kernel_tail=%u mask=%u flags=%u\n",
+				*sq_head_ptr, *sq_tail_ptr, *sq_mask, *sq_flags);
+			pr_info("  SQ ring checkpointed state: head=%u tail=%u\n",
+				entry->sq_head, entry->sq_tail);
 
-			/* Set head=tail=0 to make ring empty */
-			*sq_head = 0;
-			*sq_tail = 0;
+			/* Restore to checkpointed values */
+			*sq_head_ptr = entry->sq_head;
+			*sq_tail_ptr = entry->sq_tail;
 
-			pr_info("  SQ ring sanitized: head=0 tail=0\n");
+			pr_info("  SQ ring restored: head=%u tail=%u\n", entry->sq_head, entry->sq_tail);
 
-			/* Also sanitize CQ if it shares the same mapping */
+			/* Also restore CQ if it shares the same mapping */
 			if (!cq_ring_seen || cq_ring_primary == sq_ring_primary) {
-				volatile uint32_t *cq_head, *cq_tail;
+				volatile uint32_t *cq_head_ptr, *cq_tail_ptr;
 
-				cq_head = (uint32_t*)((char*)sq_ring_primary + params.cq_off.head);
-				cq_tail = (uint32_t*)((char*)sq_ring_primary + params.cq_off.tail);
+				cq_head_ptr = (uint32_t*)((char*)sq_ring_primary + params.cq_off.head);
+				cq_tail_ptr = (uint32_t*)((char*)sq_ring_primary + params.cq_off.tail);
 
-				pr_info("  CQ ring (shared) state before sanitize: head=%u tail=%u\n",
-					*cq_head, *cq_tail);
+				pr_info("  CQ ring (shared) state before restore: kernel_head=%u kernel_tail=%u\n",
+					*cq_head_ptr, *cq_tail_ptr);
+				pr_info("  CQ ring checkpointed state: head=%u tail=%u\n",
+					entry->cq_head, entry->cq_tail);
 
-				*cq_head = 0;
-				*cq_tail = 0;
+				*cq_head_ptr = entry->cq_head;
+				*cq_tail_ptr = entry->cq_tail;
 
-				pr_info("  CQ ring (shared) sanitized: head=0 tail=0\n");
+				pr_info("  CQ ring (shared) restored: head=%u tail=%u\n",
+					entry->cq_head, entry->cq_tail);
 			}
 		}
 
-		/* Sanitize separate CQ ring if it exists */
+		/* Restore separate CQ ring if it exists */
 		if (cq_ring_mapped && cq_ring_primary != sq_ring_primary) {
-			volatile uint32_t *cq_head, *cq_tail;
+			volatile uint32_t *cq_head_ptr, *cq_tail_ptr;
 
-			cq_head = (uint32_t*)((char*)cq_ring_primary + params.cq_off.head);
-			cq_tail = (uint32_t*)((char*)cq_ring_primary + params.cq_off.tail);
+			cq_head_ptr = (uint32_t*)((char*)cq_ring_primary + params.cq_off.head);
+			cq_tail_ptr = (uint32_t*)((char*)cq_ring_primary + params.cq_off.tail);
 
-			pr_info("  CQ ring (separate) state before sanitize: head=%u tail=%u\n",
-				*cq_head, *cq_tail);
+			pr_info("  CQ ring (separate) state before restore: kernel_head=%u kernel_tail=%u\n",
+				*cq_head_ptr, *cq_tail_ptr);
+			pr_info("  CQ ring checkpointed state: head=%u tail=%u\n",
+				entry->cq_head, entry->cq_tail);
 
-			*cq_head = 0;
-			*cq_tail = 0;
+			*cq_head_ptr = entry->cq_head;
+			*cq_tail_ptr = entry->cq_tail;
 
-			pr_info("  CQ ring (separate) sanitized: head=0 tail=0\n");
+			pr_info("  CQ ring (separate) restored: head=%u tail=%u\n",
+				entry->cq_head, entry->cq_tail);
 		}
 
-		pr_info("  io_uring %d rings sanitized to empty state\n", entry->id);
+		pr_info("  io_uring %d ring state restored to checkpointed values\n", entry->id);
 	} else {
 			/*
 			 * Fallback: use legacy single-address fields.

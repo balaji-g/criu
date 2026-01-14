@@ -165,6 +165,7 @@ extern int dump_namespaces(struct pstree_item *item, unsigned int ns_flags);
 extern int prepare_namespace_before_tasks(void);
 extern int prepare_namespace(struct pstree_item *item, unsigned long clone_flags);
 extern int prepare_userns_creds(void);
+extern bool is_joining_namespace(unsigned int ns_flag);
 
 extern int switch_ns(int pid, struct ns_desc *nd, int *rst);
 extern int switch_mnt_ns(int pid, int *rst, int *cwd_fd);

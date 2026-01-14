@@ -491,6 +491,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_skip_missing_files)
 		opts.skip_missing_files = req->skip_missing_files;
 
+	if (req->has_skip_io_uring)
+		opts.skip_io_uring = req->skip_io_uring;
+
 	if (req->has_portable)
 		opts.portable = req->portable;
 

@@ -332,9 +332,14 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 	FownEntry *fown;
 	void *m;
 
-	/* Skip unix sockets for portable checkpoints */
-	if (opts.skip_unix_sockets || opts.portable) {
-		pr_info("Skipping unix socket fd %d (--skip-unix-sockets/--portable)\n", lfd);
+	/*
+	 * Skip unix sockets only if explicitly requested.
+	 * Note: --portable no longer skips unix sockets - it only affects page
+	 * saving strategy. Internal unix sockets (socketpair, in-tree sockets)
+	 * are essential for multiprocess IPC and must be checkpointed.
+	 */
+	if (opts.skip_unix_sockets) {
+		pr_info("Skipping unix socket fd %d (--skip-unix-sockets)\n", lfd);
 		/*
 		 * Return -ENOENT to indicate this fd should be skipped entirely.
 		 * This tells dump_task_files_seized to NOT write fdinfo for this fd,
@@ -1289,6 +1294,18 @@ static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd, int *prev
 		int ns_fd;
 
 		if (mntns == NULL) {
+			/*
+			 * With --skip-mnt-ns, mount namespace info isn't available.
+			 * For unix sockets in container-local paths (/tmp, /dev/shm),
+			 * try to create the socket in the current namespace instead.
+			 * This allows IPC sockets between processes to be restored.
+			 */
+			if (opts.skip_mnt_ns) {
+				pr_warn("unix: Mount %d not found (--skip-mnt-ns), using current namespace for socket %s\n",
+					ui->ue->mnt_id, ui->name);
+				/* Don't switch namespace, use current */
+				goto skip_mntns_switch;
+			}
 			pr_err("Unable to find the %d mount\n", ui->ue->mnt_id);
 			goto err;
 		}
@@ -1304,6 +1321,7 @@ static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd, int *prev
 
 		close(ns_fd);
 	}
+skip_mntns_switch:
 
 	if (prev_root_fd && (root_ns_mask & CLONE_NEWNS)) {
 		if (ui->ue->mnt_id >= 0) {
@@ -1313,8 +1331,18 @@ static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd, int *prev
 				root = lookup_ns_by_id(root_item->ids->mnt_ns_id, &mnt_ns_desc);
 			ns = root;
 		}
-		if (ns == NULL)
+		if (ns == NULL) {
+			/*
+			 * With --skip-mnt-ns, we can't look up mount namespaces.
+			 * Skip the chroot/chdir and try to create socket in current dir.
+			 */
+			if (opts.skip_mnt_ns) {
+				pr_warn("unix: Mount ns lookup failed (--skip-mnt-ns), skipping chroot for socket %s\n",
+					ui->name);
+				goto skip_chroot;
+			}
 			goto err;
+		}
 
 		fd = fdstore_get(ns->mnt.root_fd_id);
 		if (fd < 0) {
@@ -1333,6 +1361,7 @@ static int prep_unix_sk_cwd(struct unix_sk_info *ui, int *prev_cwd_fd, int *prev
 			goto err;
 		}
 	}
+skip_chroot:
 
 	if (ui->name_dir) {
 		if (chdir(ui->name_dir)) {

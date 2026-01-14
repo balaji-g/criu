@@ -44,12 +44,27 @@ static unsigned int join_ns_flags;
 
 static int collect_pid_namespaces(bool);
 
+/* Helper function for other modules to check if we're joining a specific namespace */
+bool is_joining_namespace(unsigned int ns_flag)
+{
+	return (join_ns_flags & ns_flag) != 0;
+}
+
 int check_namespace_opts(void)
 {
+	/*
+	 * Allow empty_ns for namespaces we're not joining.
+	 * Only conflict if trying to both join AND create empty for same namespace.
+	 * This allows: --join-ns net:X --empty-ns net (skip net device restore, use joined ns)
+	 * Actually, even that should be allowed for the case where we want to skip
+	 * device restoration but join an existing namespace.
+	 * 
+	 * For now, just warn instead of error, since we handle it correctly in net.c
+	 */
 	errno = EINVAL;
 	if (join_ns_flags & opts.empty_ns) {
-		pr_err("Conflicting flags: --join-ns and --empty-ns\n");
-		return -1;
+		/* Changed from error to warning - we handle this case specially */
+		pr_warn("Both --join-ns and --empty-ns specified for same namespace type; will join ns and skip device restoration\n");
 	}
 	if (join_ns_flags & CLONE_NEWUSER)
 		pr_warn("join-ns with user-namespace is not fully tested and dangerous\n");

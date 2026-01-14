@@ -148,6 +148,7 @@ message criu_opts {
 	optional bool			skip_mnt_ns		= 72;
 	optional bool			skip_missing_fds	= 73;
 	optional bool			skip_missing_files	= 74;
+	optional bool			skip_io_uring		= 76;
 	optional bool			portable		= 75;
 /*	optional bool			check_mounts		= 128;	*/
 }

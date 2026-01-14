@@ -1334,6 +1334,40 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		}
 	}
 
+	/*
+	 * CRITICAL: Restore ring head/tail to checkpointed values.
+	 *
+	 * libuv/uvloop cache head/tail values internally. The kernel's new ring
+	 * is initialized to 0, but the app expects them at the checkpointed position.
+	 * If we don't restore them, there's a mismatch that causes crashes.
+	 */
+	if (ring->sq_ring_addr) {
+		volatile uint32_t *sq_head_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.head);
+		volatile uint32_t *sq_tail_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.tail);
+
+		pr_info("  SQ ring state: kernel_head=%u kernel_tail=%u, checkpointed head=%u tail=%u\n",
+			*sq_head_ptr, *sq_tail_ptr, ring->sq_head, ring->sq_tail);
+
+		*sq_head_ptr = ring->sq_head;
+		*sq_tail_ptr = ring->sq_tail;
+
+		pr_info("  SQ ring restored: head=%u tail=%u\n", ring->sq_head, ring->sq_tail);
+
+		/* Restore CQ ring (usually shares same mapping via SINGLE_MMAP) */
+		{
+			volatile uint32_t *cq_head_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.cq_off.head);
+			volatile uint32_t *cq_tail_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.cq_off.tail);
+
+			pr_info("  CQ ring state: kernel_head=%u kernel_tail=%u, checkpointed head=%u tail=%u\n",
+				*cq_head_ptr, *cq_tail_ptr, ring->cq_head, ring->cq_tail);
+
+			*cq_head_ptr = ring->cq_head;
+			*cq_tail_ptr = ring->cq_tail;
+
+			pr_info("  CQ ring restored: head=%u tail=%u\n", ring->cq_head, ring->cq_tail);
+		}
+	}
+
 	/* If the fd doesn't match, dup2 it to the expected fd */
 	if ((unsigned int)fd != ring->fd) {
 		ret = sys_dup2(fd, ring->fd);
@@ -1347,7 +1381,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		pr_info("  Moved fd from %d to %u\n", fd, ring->fd);
 	}
 
-	pr_info("Restored io_uring ring at fd=%u\n", ring->fd);
+	pr_info("Restored io_uring ring at fd=%u (with head/tail restored)\n", ring->fd);
 
 	/*
 	 * Replay deferred epoll registrations.
@@ -2685,6 +2719,43 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	restore_posix_timers(args);
 
 	sys_munmap(args->rst_mem, args->rst_mem_size);
+
+	/*
+	 * Post-restore stabilization delay.
+	 *
+	 * After CRIU restore, thread scheduling order changes and libraries
+	 * like libuv (used by uvloop/vLLM) may have internal state that is
+	 * sensitive to timing. A brief delay allows the scheduler to settle
+	 * and helps avoid race conditions in userspace event loops.
+	 *
+	 * This is a workaround for a race condition where libuv's io_uring
+	 * backend aborts due to internal state inconsistency after restore.
+	 */
+	{
+		struct timespec delay = { .tv_sec = 0, .tv_nsec = 200000000 }; /* 200ms */
+		register long _ret asm("rax");
+		register long _nr  asm("rax") = 35; /* __NR_nanosleep */
+		register long _a1  asm("rdi") = (long)&delay;
+		register long _a2  asm("rsi") = 0;  /* NULL rem */
+
+		asm volatile("syscall"
+			     : "=a"(_ret)
+			     : "0"(_nr), "r"(_a1), "r"(_a2)
+			     : "memory", "rcx", "r11");
+
+		pr_info("Post-restore stabilization delay completed (200ms)\n");
+
+		/* Also yield to let other threads run */
+		_nr = 24; /* __NR_sched_yield */
+		asm volatile("syscall"
+			     : "=a"(_ret)
+			     : "0"(_nr)
+			     : "memory", "rcx", "r11");
+		asm volatile("syscall"
+			     : "=a"(_ret)
+			     : "0"(_nr)
+			     : "memory", "rcx", "r11");
+	}
 
 	/*
 	 * Sigframe stack.

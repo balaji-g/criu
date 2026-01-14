@@ -2974,7 +2974,12 @@ static int prepare_net_ns_first_stage(struct ns_id *ns)
 {
 	int ret = 0;
 
-	if (ns->ext_key || (opts.empty_ns & CLONE_NEWNET))
+	/* Skip network device restoration if:
+	 * - Network namespace is external (ext_key)
+	 * - We're creating an empty network namespace
+	 * - We're joining an existing network namespace (JoinNs)
+	 */
+	if (ns->ext_key || (opts.empty_ns & CLONE_NEWNET) || is_joining_namespace(CLONE_NEWNET))
 		return 0;
 
 	ret = restore_netns_conf(ns);
@@ -2990,7 +2995,8 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 {
 	int ret = 0, nsid = ns->id;
 
-	if (!(opts.empty_ns & CLONE_NEWNET) && !ns->ext_key) {
+	/* Skip network config restoration if using empty_ns, ext_key, or joining existing ns */
+	if (!(opts.empty_ns & CLONE_NEWNET) && !ns->ext_key && !is_joining_namespace(CLONE_NEWNET)) {
 		if (ns->net.netns)
 			netns_entry__free_unpacked(ns->net.netns, NULL);
 
@@ -3098,8 +3104,11 @@ static int __prepare_net_namespaces(void *unused)
 		}
 	}
 
-	if (restore_links())
-		goto err;
+	/* Skip network link restoration if joining an existing network namespace */
+	if (!is_joining_namespace(CLONE_NEWNET)) {
+		if (restore_links())
+			goto err;
+	}
 
 	for (nsid = ns_ids; nsid != NULL; nsid = nsid->next) {
 		if (nsid->nd != &net_ns_desc)

@@ -466,9 +466,13 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	TcpOptsEntry tcpopts = TCP_OPTS_ENTRY__INIT;
 	int ret = -1, err = -1, proto, aux, type;
 
-	/* Skip inet sockets for portable checkpoints */
-	if (opts.skip_inet_sockets || opts.portable) {
-		pr_info("Skipping inet socket fd %d (--skip-inet-sockets/--portable)\n", lfd);
+	/*
+	 * Skip inet sockets only if explicitly requested.
+	 * Note: --portable no longer skips inet sockets - it only affects page
+	 * saving strategy. Listen sockets are essential for server processes.
+	 */
+	if (opts.skip_inet_sockets) {
+		pr_info("Skipping inet socket fd %d (--skip-inet-sockets)\n", lfd);
 		/*
 		 * Return -ENOENT to indicate this fd should be skipped entirely.
 		 * This tells dump_task_files_seized to NOT write fdinfo for this fd,
@@ -498,6 +502,23 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 		if (!sk)
 			goto err;
 	}
+
+	/*
+	 * Skip TCP sockets in transient/closing states - they're garbage after restore.
+	 * Only keep: TCP_LISTEN (servers) and TCP_ESTABLISHED (if --tcp-established).
+	 * All other states are mid-close or already closed - useless to checkpoint.
+	 */
+	if (proto == IPPROTO_TCP && sk->state != TCP_LISTEN && sk->state != TCP_ESTABLISHED) {
+		pr_info("Skipping TCP socket in state %s (port %d) - transient/closed state\n",
+			___tcp_state_name(sk->state), sk->src_port);
+		return -ENOENT;  /* Skip this fd entirely */
+	}
+
+	/*
+	 * NOTE: We no longer skip sockets bound to pod-specific IPs.
+	 * The restore-entrypoint adds the original pod IP to loopback,
+	 * allowing these sockets to bind successfully after restore.
+	 */
 
 	sk->cork = false;
 	if (type != SOCK_RAW) {
@@ -1067,6 +1088,26 @@ int inet_bind(int sk, struct inet_sk_info *ii)
 	}
 
 	if (bind(sk, (struct sockaddr *)&addr, addr_size) == -1) {
+		/*
+		 * When joining an existing network namespace (e.g., in K8s pod restore),
+		 * sockets bound to specific IPs will fail if the pod's IP changed.
+		 * For sockets NOT bound to INADDR_ANY (0.0.0.0) or IN6ADDR_ANY (::),
+		 * skip with a warning instead of failing the entire restore.
+		 */
+		if (is_joining_namespace(CLONE_NEWNET)) {
+			bool is_any_addr = false;
+			if (ii->ie->family == AF_INET && ii->ie->n_src_addr >= 1) {
+				is_any_addr = (ii->ie->src_addr[0] == 0);  /* INADDR_ANY */
+			} else if (ii->ie->family == AF_INET6 && ii->ie->n_src_addr >= 4) {
+				/* Check if all 4 uint32s are zero (128-bit IPv6 addr) */
+				is_any_addr = (ii->ie->src_addr[0] == 0 && ii->ie->src_addr[1] == 0 &&
+				               ii->ie->src_addr[2] == 0 && ii->ie->src_addr[3] == 0);
+			}
+			if (!is_any_addr) {
+				pr_warn("inet: Skipping socket bind (id %d) - address not available in joined netns\n", ii->ie->id);
+				return 0;  /* Skip this socket, continue restore */
+			}
+		}
 		pr_perror("Can't bind inet socket (id %d)", ii->ie->id);
 		return -1;
 	}

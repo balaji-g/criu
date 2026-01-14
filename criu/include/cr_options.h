@@ -205,6 +205,7 @@ struct cr_options {
 	int skip_lsm;  /* Skip LSM (AppArmor/SELinux) profile restoration */
 	int skip_missing_files;  /* Skip files that don't exist on restore (e.g., temp logs) */
 	int skip_missing_fds;    /* Skip FDs that reference missing files (e.g., skipped unix sockets) */
+	int skip_io_uring;       /* Skip io_uring restoration - apps will recreate or fall back */
 	int portable;  /* Portable checkpoint mode: skip sockets, temp files for cross-node migration */
 
 	/*

@@ -13,6 +13,7 @@ struct fd_parms;
 struct file_remap {
 	char *rpath;
 	bool is_dir;
+	bool is_ghost;  /* True if this is a ghost file remap (not linked) */
 	int rmnt_id;
 	uid_t uid;
 	gid_t gid;

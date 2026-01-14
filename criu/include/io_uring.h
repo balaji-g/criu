@@ -89,6 +89,16 @@ struct rst_io_uring_ring {
 	unsigned int fd;
 
 	/*
+	 * Ring state from checkpoint - must be restored to match app's internal state.
+	 * libuv/uvloop cache these values internally; if we don't restore them,
+	 * there's a mismatch between kernel ring state and app state, causing crashes.
+	 */
+	unsigned int sq_head;
+	unsigned int sq_tail;
+	unsigned int cq_head;
+	unsigned int cq_tail;
+
+	/*
 	 * Deferred epoll registrations.
 	 * These are collected during prepare_io_urings() by scanning
 	 * eventpoll images for tfds matching this io_uring's fd.

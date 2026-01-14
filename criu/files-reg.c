@@ -78,6 +78,14 @@ struct ghost_file {
 	u32 ino;
 
 	struct file_remap remap;
+
+	/*
+	 * Reference counting for shared ghost files (e.g., /dev/shm).
+	 * Multiple processes may map the same ghost file. We must not
+	 * unlink until ALL processes have successfully opened it.
+	 */
+	int users;   /* How many reg_file_infos reference this ghost */
+	int opened;  /* How many have successfully opened */
 };
 
 static u32 ghost_file_ids = 1;
@@ -590,9 +598,12 @@ static int collect_remap_ghost(struct reg_file_info *rfi, RemapFilePathEntry *rp
 		return -1;
 	gf->remap.rpath[0] = 0;
 	gf->id = rpe->remap_id;
+	gf->users = 0;
+	gf->opened = 0;
 	list_add_tail(&gf->list, &ghost_files);
 
 gf_found:
+	gf->users++;  /* Track how many file_infos use this ghost */
 	rfi->is_dir = gf->remap.is_dir;
 	rfi->remap = &gf->remap;
 	return 0;
@@ -634,6 +645,7 @@ static int open_remap_ghost(struct reg_file_info *rfi, RemapFilePathEntry *rpe)
 	close_image(img);
 
 	gf->remap.is_dir = S_ISDIR(gfe->mode);
+	gf->remap.is_ghost = true;  /* Mark as ghost remap for reference counting */
 	gf->remap.uid = gfe->uid;
 	gf->remap.gid = gfe->gid;
 	ghost_file_entry__free_unpacked(gfe, NULL);
@@ -685,6 +697,7 @@ static int collect_remap_linked(struct reg_file_info *rfi, RemapFilePathEntry *r
 
 	rm->rpath = rrfi->path;
 	rm->is_dir = false;
+	rm->is_ghost = false;  /* Linked remaps don't use ghost reference counting */
 	rm->uid = -1;
 	rm->gid = -1;
 	rm->rmnt_id = rfi->rfe->mnt_id;
@@ -2417,17 +2430,59 @@ ext:
 	if (rfi->remap) {
 		if (!rfi->remap->is_dir) {
 			struct mount_info *mi = lookup_mnt_id(rfi->rfe->mnt_id);
+			bool should_unlink = true;
 
 			if (mi && try_remount_writable(mi, true))
 				goto err;
 
-			pr_debug("Unlink: %d:%s\n", rfi->rfe->mnt_id, rfi->path);
-			if (unlinkat(mntns_root, rfi->path, 0)) {
-				pr_perror("Failed to unlink the remap file");
-				goto err;
+			/*
+			 * For ghost remaps shared by multiple processes (e.g., /dev/shm),
+			 * we must not unlink until ALL processes have opened the file.
+			 * Otherwise, later processes get "No such file or directory".
+			 */
+			if (rfi->remap->is_ghost) {
+				struct ghost_file *gf = container_of(rfi->remap, struct ghost_file, remap);
+				gf->opened++;
+				if (gf->opened < gf->users) {
+					pr_debug("Ghost %s: opened %d/%d, deferring unlink\n",
+						 rfi->path, gf->opened, gf->users);
+					should_unlink = false;
+				} else {
+					pr_debug("Ghost %s: all %d users done, unlinking\n",
+						 rfi->path, gf->users);
+					/*
+					 * CRITICAL: Before unlinking the ghost file, create a
+					 * hardlink to the ORIGINAL path so that future open-by-name
+					 * calls (e.g., shm_open) will succeed.
+					 *
+					 * This is needed for Python multiprocessing / torch IPC which
+					 * may reopen shared memory by name during inference.
+					 *
+					 * orig_path = original path (e.g., dev/shm/pym-*)
+					 * rfi->path = ghost path (e.g., dev/shm/pym-*.cr.N.ghost)
+					 */
+					if (orig_path && strstr(orig_path, "dev/shm/")) {
+						pr_info("Re-materializing shm path: %s -> %s\n",
+							rfi->path, orig_path);
+						if (linkat(mntns_root, rfi->path, mntns_root, orig_path, 0) == 0) {
+							pr_info("Created hardlink for shm file %s\n", orig_path);
+						} else if (errno != EEXIST) {
+							pr_warn("Could not re-materialize shm path %s: %m\n", orig_path);
+							/* Not fatal - the FD still works, just not open-by-name */
+						}
+					}
+				}
 			}
-			if (rm_parent_dirs(mntns_root, rfi->path, level))
-				goto err;
+
+			if (should_unlink) {
+				pr_debug("Unlink: %d:%s\n", rfi->rfe->mnt_id, rfi->path);
+				if (unlinkat(mntns_root, rfi->path, 0)) {
+					pr_perror("Failed to unlink the remap file");
+					goto err;
+				}
+				if (rm_parent_dirs(mntns_root, rfi->path, level))
+					goto err;
+			}
 		}
 
 		mutex_unlock(remap_open_lock);
