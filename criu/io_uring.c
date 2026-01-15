@@ -99,6 +99,25 @@ struct io_uring_params {
 #define IORING_OFF_SQES		0x10000000ULL
 #endif
 
+/* Setup flags for element size variants */
+#ifndef IORING_SETUP_SQE128
+#define IORING_SETUP_SQE128	(1U << 8)  /* 128-byte SQEs (NVMe passthrough) */
+#endif
+#ifndef IORING_SETUP_CQE32
+#define IORING_SETUP_CQE32	(1U << 9)  /* 32-byte CQEs (NVMe passthrough) */
+#endif
+
+/* Element sizes */
+#define SIZEOF_SQE_NORMAL	64
+#define SIZEOF_SQE_128		128
+#define SIZEOF_CQE_NORMAL	16
+#define SIZEOF_CQE_32		32
+
+static inline uint32_t get_sqe_size_for_flags(uint32_t flags)
+{
+	return (flags & IORING_SETUP_SQE128) ? SIZEOF_SQE_128 : SIZEOF_SQE_NORMAL;
+}
+
 struct io_uring_fdinfo {
 	uint32_t sq_mask;
 	uint32_t sq_head;
@@ -491,7 +510,10 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 #define IORING_SETUP_SQPOLL (1U << 1)
 		if (fdinfo.sq_thread >= 0) {
 			entry->flags |= IORING_SETUP_SQPOLL;
-			pr_info("io_uring fd %d has SQPOLL (thread=%d)\n", fd, fdinfo.sq_thread);
+			pr_warn("io_uring fd %d has SQPOLL (thread=%d cpu=%d)\n",
+			       fd, fdinfo.sq_thread, fdinfo.sq_thread_cpu);
+			pr_warn("  WARNING: SQPOLL kernel thread will be RECREATED on restore.\n");
+			pr_warn("  The original thread won't survive. App may need adjustment.\n");
 		}
 
 		entry->sq_thread_cpu = fdinfo.sq_thread_cpu;
@@ -563,31 +585,64 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 			continue;
 
 		/*
-		 * Compute sq_entries and cq_entries from VMA sizes.
-		 * SQEs VMA size = sq_entries * 64 bytes (sizeof(struct io_uring_sqe))
-		 * The kernel's fdinfo doesn't expose these values, so we derive them.
+		 * Compute sq_entries and cq_entries.
+		 *
+		 * Primary source: sq_mask from fdinfo (sq_mask = sq_entries - 1).
+		 * This is reliable because kernel exposes it directly.
+		 *
+		 * Fallback: compute from VMA size / SQE size.
+		 * Note: SQE size is normally 64 bytes, but IORING_SETUP_SQE128
+		 * uses 128-byte SQEs. We detect this by checking if the VMA
+		 * size makes sense with either size.
 		 */
-		if (entry->sqe_size > 0) {
-			entry->sq_entries = entry->sqe_size / 64;
-			if (entry->sq_entries == 0)
-				entry->sq_entries = 1;
+		if (entry->sq_mask > 0) {
+			/* Use mask from fdinfo (reliable) */
+			entry->sq_entries = entry->sq_mask + 1;
+		} else if (entry->sqe_size > 0) {
+			/*
+			 * Infer SQE size from VMA size:
+			 * - Standard: VMA = entries * 64
+			 * - SQE128:   VMA = entries * 128
+			 * Check which one gives a power-of-2 result.
+			 */
+			uint32_t entries_64 = entry->sqe_size / SIZEOF_SQE_NORMAL;
+			uint32_t entries_128 = entry->sqe_size / SIZEOF_SQE_128;
+			
+			if (entries_128 > 0 && (entries_128 & (entries_128 - 1)) == 0 &&
+			    entries_128 * SIZEOF_SQE_128 == entry->sqe_size) {
+				/* SQE128 mode - set flag */
+				entry->flags |= IORING_SETUP_SQE128;
+				entry->sq_entries = entries_128;
+				pr_info("  Detected SQE128 mode: %u entries\n", entries_128);
+			} else if (entries_64 > 0) {
+				entry->sq_entries = entries_64;
+			} else {
+				entry->sq_entries = 32; /* fallback */
+			}
 		} else {
 			/* Try to find SQEs from vmas array */
-			size_t sqe_size = 0;
+			size_t sqe_vma_size = 0;
 			size_t k;
 			for (k = 0; k < entry->n_vmas; k++) {
 				if (entry->vmas[k] && entry->vmas[k]->pgoff == IORING_OFF_SQES &&
-				    entry->vmas[k]->size > sqe_size)
-					sqe_size = entry->vmas[k]->size;
+				    entry->vmas[k]->size > sqe_vma_size)
+					sqe_vma_size = entry->vmas[k]->size;
 			}
-			entry->sq_entries = sqe_size > 0 ? sqe_size / 64 : 32;
+			entry->sq_entries = sqe_vma_size > 0 ? sqe_vma_size / SIZEOF_SQE_NORMAL : 32;
 		}
-		/* CQ entries are typically 2x SQ entries, use same value as fallback */
-		if (entry->cq_entries == 0)
+		
+		/* CQ entries: use mask if available, otherwise 2x SQ entries */
+		if (entry->cq_mask > 0) {
+			entry->cq_entries = entry->cq_mask + 1;
+		} else if (entry->cq_entries == 0) {
 			entry->cq_entries = entry->sq_entries * 2;
-		/* Update sq_mask/cq_mask for consistency */
-		entry->sq_mask = entry->sq_entries - 1;
-		entry->cq_mask = entry->cq_entries - 1;
+		}
+		
+		/* Update masks for consistency */
+		if (entry->sq_mask == 0)
+			entry->sq_mask = entry->sq_entries - 1;
+		if (entry->cq_mask == 0)
+			entry->cq_mask = entry->cq_entries - 1;
 
 		iufe.id = entry->id;
 		iufe.ino = entry->ino;

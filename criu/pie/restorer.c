@@ -1075,8 +1075,27 @@ populate:
 #define IORING_FEAT_FAST_POLL		(1U << 5)
 #define IORING_FEAT_POLL_32BITS		(1U << 6)
 
-/* Size of io_uring_cqe structure (16 bytes) */
-#define SIZEOF_IO_URING_CQE	16
+/* Setup flags for element size variants */
+#define IORING_SETUP_SQE128		(1U << 8)  /* 128-byte SQEs */
+#define IORING_SETUP_CQE32		(1U << 9)  /* 32-byte CQEs */
+
+/* Default element sizes */
+#define SIZEOF_IO_URING_SQE	64	/* Standard SQE size */
+#define SIZEOF_IO_URING_CQE	16	/* Standard CQE size */
+#define SIZEOF_IO_URING_SQE128	128	/* Extended SQE size */
+#define SIZEOF_IO_URING_CQE32	32	/* Extended CQE size */
+
+/* Get actual SQE size based on flags */
+static inline unsigned int get_sqe_size(unsigned int flags)
+{
+	return (flags & IORING_SETUP_SQE128) ? SIZEOF_IO_URING_SQE128 : SIZEOF_IO_URING_SQE;
+}
+
+/* Get actual CQE size based on flags */
+static inline unsigned int get_cqe_size(unsigned int flags)
+{
+	return (flags & IORING_SETUP_CQE32) ? SIZEOF_IO_URING_CQE32 : SIZEOF_IO_URING_CQE;
+}
 
 /*
  * io_uring setup parameters (from linux/io_uring.h)
@@ -1193,10 +1212,14 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	 * Calculate proper mmap sizes from kernel-returned params.
 	 * SQ ring size = sq_off.array + sq_entries * sizeof(unsigned)
 	 * CQ ring size = cq_off.cqes + cq_entries * sizeof(io_uring_cqe)
+	 *
+	 * Note: Element sizes depend on setup flags:
+	 *   - IORING_SETUP_SQE128: 128-byte SQEs (for NVMe passthrough)
+	 *   - IORING_SETUP_CQE32: 32-byte CQEs (for NVMe passthrough)
 	 */
 	sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(__u32);
-	cq_ring_size = params.cq_off.cqes + params.cq_entries * SIZEOF_IO_URING_CQE;
-	sqe_size = params.sq_entries * 64;  /* sizeof(io_uring_sqe) = 64 */
+	cq_ring_size = params.cq_off.cqes + params.cq_entries * get_cqe_size(ring->flags);
+	sqe_size = params.sq_entries * get_sqe_size(ring->flags);
 
 	/* Page align */
 	sq_ring_size = io_uring_align_up(sq_ring_size);
