@@ -341,12 +341,25 @@ static int add_vma_to_entry(IoUringEntry *entry, struct vma_area *vma, int *vma_
 	return 0;
 }
 
+/*
+ * Find existing entry by inode, or return NULL if not found.
+ * This replaces the old last_ino assumption with a proper lookup.
+ */
+static IoUringEntry *find_entry_by_ino(MmEntry *mme, int nr, unsigned long ino)
+{
+	int i;
+	for (i = 0; i < nr; i++) {
+		if (mme->io_urings[i] && mme->io_urings[i]->ino == ino)
+			return mme->io_urings[i];
+	}
+	return NULL;
+}
+
 int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 {
 	struct vma_area *vma;
 	struct io_uring_fdinfo fdinfo;
 	IoUringEntry *entry = NULL;
-	unsigned long last_ino = 0;
 	int nr = 0;
 	int ret = -1;
 	int proc_fd;
@@ -368,11 +381,16 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		close(proc_fd);
 		return -1;
 	}
+	/* Initialize to NULL for safe lookup */
+	memset(mme->io_urings, 0, vmas->nr_iourings * sizeof(IoUringEntry *));
 
 	/*
 	 * Process VMAs and collect ALL addresses per io_uring inode.
 	 * CRITICAL: uvloop creates MULTIPLE mmap()s on the same ring fd,
 	 * so we must capture and restore ALL of them.
+	 *
+	 * NOTE: We use find_entry_by_ino() to properly group VMAs by inode,
+	 * rather than assuming VMAs are sorted by inode (which isn't guaranteed).
 	 */
 	list_for_each_entry(vma, &vmas->h, list) {
 		int fd;
@@ -380,8 +398,16 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		if (!vma_entry_is(vma->e, VMA_AREA_IOURING))
 			continue;
 
-		/* Check if this VMA belongs to an existing entry */
-		if (vma->vm_iouring_ino == last_ino && entry != NULL) {
+		/* Check if this VMA belongs to an existing entry (by inode lookup) */
+		entry = find_entry_by_ino(mme, nr, vma->vm_iouring_ino);
+		if (entry != NULL) {
+			/* Find the vma_idx for this entry (we need to track per-entry) */
+			vma_idx = 0;
+			for (size_t k = 0; k < entry->n_vmas; k++) {
+				if (entry->vmas[k] != NULL)
+					vma_idx++;
+			}
+
 			/* Add VMA to existing entry's vmas array */
 			if (add_vma_to_entry(entry, vma, &vma_idx) < 0)
 				goto err;
@@ -400,48 +426,7 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 			continue;
 		}
 
-		/* New io_uring inode - first finalize previous entry if exists */
-		if (entry != NULL) {
-			IoUringFileEntry iufe = IO_URING_FILE_ENTRY__INIT;
-			FileEntry fe = FILE_ENTRY__INIT;
-
-			/* Compute sq_entries/cq_entries from VMA sizes */
-			if (entry->sqe_size > 0) {
-				entry->sq_entries = entry->sqe_size / 64;
-				if (entry->sq_entries == 0)
-					entry->sq_entries = 1;
-			} else {
-				size_t sqe_size = 0;
-				size_t k;
-				for (k = 0; k < entry->n_vmas; k++) {
-					if (entry->vmas[k]->pgoff == IORING_OFF_SQES && entry->vmas[k]->size > sqe_size)
-						sqe_size = entry->vmas[k]->size;
-				}
-				entry->sq_entries = sqe_size > 0 ? sqe_size / 64 : 32;
-			}
-			if (entry->cq_entries == 0)
-				entry->cq_entries = entry->sq_entries * 2;
-			entry->sq_mask = entry->sq_entries - 1;
-			entry->cq_mask = entry->cq_entries - 1;
-
-			mme->io_urings[nr++] = entry;
-
-			iufe.id = entry->id;
-			iufe.ino = entry->ino;
-			fe.type = FD_TYPES__IO_URING;
-			fe.id = iufe.id;
-			fe.iouring = &iufe;
-
-			if (pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE)) {
-				pr_err("Failed to write io_uring file entry\n");
-				goto err;
-			}
-
-			pr_info("Dumped io_uring fd %d: SQ=%u CQ=%u n_vmas=%zu (computed from VMA sizes)\n",
-				entry->id, entry->sq_entries, entry->cq_entries, entry->n_vmas);
-		}
-
-		/* Create new entry for this io_uring */
+		/* New io_uring inode - create a new entry */
 		if (find_io_uring_fd(pid, vma->vm_iouring_ino, &fd) < 0) {
 			pr_err("Can't find fd for io_uring ino %lu\n", vma->vm_iouring_ino);
 			goto err;
@@ -452,10 +437,39 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 			goto err;
 		}
 
-		if (fdinfo.sqes > 0 || fdinfo.cqes > 0) {
-			pr_err("io_uring fd %d has pending I/O: SQEs=%u CQEs=%u\n",
-			       fd, fdinfo.sqes, fdinfo.cqes);
+		/*
+		 * QUIESCENCE CHECK: Ensure io_uring ring is idle before checkpoint.
+		 *
+		 * We check TWO things:
+		 * 1. SQEs/CQEs count: These are registered files/buffers (less critical)
+		 * 2. head != tail: This means pending submissions or completions (CRITICAL)
+		 *
+		 * If sq_head != sq_tail: there are unprocessed submission entries
+		 * If cq_head != cq_tail: there are unprocessed completion entries
+		 *
+		 * We MUST fail if the ring is not quiescent - restoring with in-flight
+		 * I/O will cause corruption or hangs.
+		 */
+		if (fdinfo.sq_head != fdinfo.sq_tail) {
+			pr_err("io_uring fd %d has pending submissions: sq_head=%u sq_tail=%u\n",
+			       fd, fdinfo.sq_head, fdinfo.sq_tail);
+			pr_err("  Checkpoint while io_uring is busy is not supported.\n");
+			pr_err("  Ensure application drains io_uring before checkpoint.\n");
 			goto err;
+		}
+		if (fdinfo.cq_head != fdinfo.cq_tail) {
+			pr_err("io_uring fd %d has pending completions: cq_head=%u cq_tail=%u\n",
+			       fd, fdinfo.cq_head, fdinfo.cq_tail);
+			pr_err("  Checkpoint while io_uring is busy is not supported.\n");
+			pr_err("  Ensure application drains io_uring before checkpoint.\n");
+			goto err;
+		}
+		/* Also check registered resources (less critical but log warning) */
+		if (fdinfo.user_files > 0 || fdinfo.user_bufs > 0) {
+			pr_warn("io_uring fd %d has registered resources: files=%u bufs=%u\n",
+			       fd, fdinfo.user_files, fdinfo.user_bufs);
+			pr_warn("  Registered files/buffers will NOT be restored.\n");
+			/* Continue anyway - registered resources are re-established by app */
 		}
 
 		entry = xmalloc(sizeof(*entry));
@@ -532,13 +546,21 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 			entry->sqe_size = vma->e->end - vma->e->start;
 		}
 
-		last_ino = vma->vm_iouring_ino;
+		/* Store new entry in array */
+		mme->io_urings[nr++] = entry;
 	}
 
-	/* Finalize the last entry */
-	if (entry != NULL) {
+	/*
+	 * Second pass: finalize all entries and write file entries.
+	 * This is done after all VMAs are collected so we have complete info.
+	 */
+	for (int i = 0; i < nr; i++) {
 		IoUringFileEntry iufe = IO_URING_FILE_ENTRY__INIT;
 		FileEntry fe = FILE_ENTRY__INIT;
+
+		entry = mme->io_urings[i];
+		if (!entry)
+			continue;
 
 		/*
 		 * Compute sq_entries and cq_entries from VMA sizes.
@@ -554,7 +576,8 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 			size_t sqe_size = 0;
 			size_t k;
 			for (k = 0; k < entry->n_vmas; k++) {
-				if (entry->vmas[k]->pgoff == IORING_OFF_SQES && entry->vmas[k]->size > sqe_size)
+				if (entry->vmas[k] && entry->vmas[k]->pgoff == IORING_OFF_SQES &&
+				    entry->vmas[k]->size > sqe_size)
 					sqe_size = entry->vmas[k]->size;
 			}
 			entry->sq_entries = sqe_size > 0 ? sqe_size / 64 : 32;
@@ -565,8 +588,6 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		/* Update sq_mask/cq_mask for consistency */
 		entry->sq_mask = entry->sq_entries - 1;
 		entry->cq_mask = entry->cq_entries - 1;
-
-		mme->io_urings[nr++] = entry;
 
 		iufe.id = entry->id;
 		iufe.ino = entry->ino;
