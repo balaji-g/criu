@@ -1175,7 +1175,17 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	/* Set up the ring configuration */
 	params.sq_entries = ring->sq_entries;
 	params.cq_entries = ring->cq_entries;
-	params.flags = ring->flags;
+	/*
+	 * Strip SQPOLL flag (1U << 1) - SQPOLL creates a kernel thread that
+	 * can't be checkpointed. We restore without SQPOLL; the application
+	 * will still work but with slightly different performance characteristics.
+	 */
+#define IORING_SETUP_SQPOLL_RST (1U << 1)
+	params.flags = ring->flags & ~IORING_SETUP_SQPOLL_RST;
+	if (ring->flags & IORING_SETUP_SQPOLL_RST) {
+		pr_info("  Stripping SQPOLL flag for restore (was 0x%x, now 0x%x)\n",
+			ring->flags, params.flags);
+	}
 
 	/* If SQPOLL was enabled, set the CPU affinity */
 	if (ring->sq_thread_cpu >= 0) {

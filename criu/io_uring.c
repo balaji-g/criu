@@ -547,6 +547,8 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		entry->n_vmas = count_vmas_for_ino(vmas, vma->vm_iouring_ino);
 		entry->vmas = xmalloc(entry->n_vmas * sizeof(IoUringVma *));
 		if (!entry->vmas) goto err;
+		/* CRITICAL: Zero the array so non-NULL check in add_vma_to_entry works */
+		memset(entry->vmas, 0, entry->n_vmas * sizeof(IoUringVma *));
 		vma_idx = 0;
 
 		pr_info("io_uring fd %d (ino %lu): allocating %zu VMAs\n",
