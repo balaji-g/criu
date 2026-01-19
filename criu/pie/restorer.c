@@ -1525,20 +1525,20 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		}
 	}
 
+
 	/*
-	 * IMPORTANT: Do NOT restore checkpointed head/tail values!
+	 * IMPORTANT: Synchronize kernel ring indices with application's cached state!
 	 *
-	 * After restore, the kernel's io_uring state is FRESH (new ring from setup).
-	 * If we restore old head/tail, the kernel thinks there are pending SQEs.
-	 * Those SQEs contain stale fd numbers and buffer addresses from pre-checkpoint.
-	 * With SQPOLL, the kernel thread processes them immediately → EOPNOTSUPP crash.
+	 * After restore, the kernel's io_uring is FRESH (new ring from setup).
+	 * But the application (uvloop/libuv) has CACHED indices in its heap memory
+	 * from the checkpoint. If these don't match, operations will fail.
 	 *
-	 * Instead, leave ring empty (head == tail == 0, which kernel initialized).
-	 * The application (uvloop/libuv) will resubmit operations as needed.
-	 * This is safe because:
-	 * - All in-flight I/O was cancelled at checkpoint
-	 * - Application state was frozen at a consistent point
-	 * - uvloop will re-arm any timers/events when it resumes
+	 * The fix: Set kernel indices to match checkpointed values, but in EMPTY state:
+	 * - SQ: head = tail = checkpointed tail (empty submission queue)
+	 * - CQ: head = tail = checkpointed head (empty completion queue)
+	 *
+	 * This ensures libuv's cached pointers remain valid while the kernel
+	 * sees empty rings (no stale operations to process).
 	 */
 	if (ring->sq_ring_addr) {
 		volatile uint32_t *sq_head_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.head);
@@ -1550,8 +1550,25 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 			ring->sq_head, ring->sq_tail, ring->cq_head, ring->cq_tail);
 		pr_info("  Kernel initialized: SQ head=%u tail=%u, CQ head=%u tail=%u\n",
 			*sq_head_ptr, *sq_tail_ptr, *cq_head_ptr, *cq_tail_ptr);
-		pr_info("  Keeping ring EMPTY (head=tail=0) to avoid stale SQE processing\n");
-		/* Leave kernel's initialized values (0, 0, 0, 0) - don't restore old state */
+		/*
+		 * CRITICAL FIX: Synchronize kernel indices with libuv's cached state!
+		 *
+		 * The problem: libuv caches ring indices in its heap memory. After restore,
+		 * libuv expects indices at their checkpointed values, but kernel ring is at 0.
+		 * When libuv tries to submit/poll based on its cached values, it fails.
+		 *
+		 * Solution: Set kernel indices to match checkpointed values, but EMPTY:
+		 * - SQ: Set head = tail = checkpointed tail (empty, at libuv's position)
+		 * - CQ: Set head = tail = checkpointed head (empty, at libuv's position)
+		 */
+		*sq_head_ptr = ring->sq_tail;  /* Advance head to match tail -> SQ empty */
+		*sq_tail_ptr = ring->sq_tail;  /* Keep tail where libuv expects */
+		*cq_head_ptr = ring->cq_head;  /* Keep head where libuv expects */
+		*cq_tail_ptr = ring->cq_head;  /* Set tail to match head -> CQ empty */
+
+		pr_info("  Synchronized to: SQ head=%u tail=%u, CQ head=%u tail=%u\n",
+			*sq_head_ptr, *sq_tail_ptr, *cq_head_ptr, *cq_tail_ptr);
+		pr_info("  Rings EMPTY but indices match libuv's cached state\n");
 	}
 
 	/* If the fd doesn't match, dup2 it to the expected fd */
