@@ -1201,13 +1201,14 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	/*
 	 * Strip flags that may not be supported on older kernels (5.15).
 	 * NOTE: SQPOLL is NOT stripped - it's required for uvloop to work.
+	 * NOTE: SQE128/CQE32 are NOT stripped - they change memory layout!
+	 *       Stripping them causes 128-byte SQEs to become 64-byte,
+	 *       corrupting memory when app accesses SQE[1] at offset 128.
 	 * These are kernel version dependent and will cause EINVAL on older kernels.
 	 */
 #define IORING_STRIP_UNSUPPORTED_FLAGS ( \
 	IORING_SETUP_COOP_TASKRUN_RST |  \
 	IORING_SETUP_TASKRUN_FLAG_RST |  \
-	IORING_SETUP_SQE128_RST |        \
-	IORING_SETUP_CQE32_RST |         \
 	IORING_SETUP_SINGLE_ISSUER_RST | \
 	IORING_SETUP_DEFER_TASKRUN_RST   \
 )
@@ -1224,14 +1225,18 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	{
 		unsigned int stripped = ring->flags & IORING_STRIP_UNSUPPORTED_FLAGS;
 		if (stripped) {
-			pr_info("  Stripped unsupported flags: 0x%x (COOP=%d TASKRUN=%d SQE128=%d CQE32=%d SINGLE=%d DEFER=%d)\n",
+			pr_info("  Stripped unsupported flags: 0x%x (COOP=%d TASKRUN=%d SINGLE=%d DEFER=%d)\n",
 				stripped,
 				!!(stripped & IORING_SETUP_COOP_TASKRUN_RST),
 				!!(stripped & IORING_SETUP_TASKRUN_FLAG_RST),
-				!!(stripped & IORING_SETUP_SQE128_RST),
-				!!(stripped & IORING_SETUP_CQE32_RST),
 				!!(stripped & IORING_SETUP_SINGLE_ISSUER_RST),
 				!!(stripped & IORING_SETUP_DEFER_TASKRUN_RST));
+		}
+		/* SQE128 and CQE32 are preserved (memory layout flags) */
+		if (ring->flags & (IORING_SETUP_SQE128_RST | IORING_SETUP_CQE32_RST)) {
+			pr_info("  Preserving memory layout flags: SQE128=%d CQE32=%d\n",
+				!!(ring->flags & IORING_SETUP_SQE128_RST),
+				!!(ring->flags & IORING_SETUP_CQE32_RST));
 		}
 		if (ring->flags & IORING_SETUP_SQPOLL_RST) {
 			pr_info("  SQPOLL flag preserved - kernel will create new polling thread\n");
