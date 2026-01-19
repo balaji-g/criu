@@ -306,7 +306,26 @@ static int resolve_images_dir_path(char *images_dir_path,
 		strncpy(images_dir_path, opts.imgs_dir, PATH_MAX - 1);
 		images_dir_path[PATH_MAX - 1] = '\0';
 	} else if (req->images_dir_fd != -1) {
-		snprintf(images_dir_path, PATH_MAX, "/proc/%d/fd/%d", peer_pid, req->images_dir_fd);
+		char fd_path[64];
+		char resolved[PATH_MAX];
+		ssize_t len;
+
+		snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%d", peer_pid, req->images_dir_fd);
+		
+		/* Resolve symlink to get actual path for plugins to use */
+		len = readlink(fd_path, resolved, sizeof(resolved) - 1);
+		if (len > 0) {
+			resolved[len] = '\0';
+			snprintf(images_dir_path, PATH_MAX, "%s", resolved);
+			
+			/* Set opts.imgs_dir so plugins can find checkpoint files */
+			xfree(opts.imgs_dir);
+			opts.imgs_dir = xstrdup(resolved);
+			pr_debug("Resolved images_dir_fd to %s, set opts.imgs_dir\n", resolved);
+		} else {
+			/* Fallback: use /proc/fd path directly (may work for some operations) */
+			snprintf(images_dir_path, PATH_MAX, "%s", fd_path);
+		}
 	} else if (req->images_dir) {
 		strncpy(images_dir_path, req->images_dir, PATH_MAX - 1);
 		images_dir_path[PATH_MAX - 1] = '\0';
@@ -348,9 +367,11 @@ static int setup_images_and_workdir(const char *images_dir_path,
 
 	if (work_changed_by_rpc_conf)
 		strncpy(work_dir_path, opts.work_dir, PATH_MAX - 1);
-	else if (req->has_work_dir_fd)
-		sprintf(work_dir_path, "/proc/%d/fd/%d", peer_pid, req->work_dir_fd);
-	else if (opts.work_dir)
+	else if (req->has_work_dir_fd) {
+		char fd_path[64];
+		sprintf(fd_path, "/proc/%d/fd/%d", peer_pid, req->work_dir_fd);
+		strncpy(work_dir_path, fd_path, PATH_MAX - 1);
+	} else if (opts.work_dir)
 		strncpy(work_dir_path, opts.work_dir, PATH_MAX - 1);
 	else if (images_dir_path[0] != '\0')
 		strcpy(work_dir_path, images_dir_path);
@@ -360,9 +381,38 @@ static int setup_images_and_workdir(const char *images_dir_path,
 		return -1;
 	}
 
+	/*
+	 * If work_dir_path is a /proc/PID/fd/FD symlink, resolve it to real path.
+	 * This is needed because mount() cannot use /proc/fd paths directly.
+	 * The temp mounts CRIU creates (cr-tmpfs.XXX) need real paths.
+	 */
+	if (strncmp(work_dir_path, "/proc/", 6) == 0 && strstr(work_dir_path, "/fd/")) {
+		char resolved[PATH_MAX];
+		ssize_t len = readlink(work_dir_path, resolved, PATH_MAX - 1);
+		if (len > 0) {
+			resolved[len] = '\0';
+			strncpy(work_dir_path, resolved, PATH_MAX - 1);
+			work_dir_path[PATH_MAX - 1] = '\0';
+		}
+		/* If readlink fails, continue with original path - chdir will work */
+	}
+
 	if (chdir(work_dir_path)) {
 		pr_perror("Can't chdir to work_dir");
 		return -1;
+	}
+
+	/*
+	 * Ensure opts.work_dir is set so mount.c can use it for temp directories.
+	 * This is needed when work_dir_fd is passed - we derive the path but need
+	 * to store it in opts.work_dir for other components to use.
+	 */
+	if (!opts.work_dir && work_dir_path[0] != '\0') {
+		opts.work_dir = xstrdup(work_dir_path);
+		if (!opts.work_dir) {
+			pr_err("Can't allocate work_dir path\n");
+			return -1;
+		}
 	}
 
 	return 0;

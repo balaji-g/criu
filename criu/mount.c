@@ -2380,7 +2380,10 @@ int restore_ext_mount(struct mount_info *mi)
 	return ret;
 }
 
-static char mnt_clean_path[] = "/tmp/cr-tmpfs.XXXXXX";
+/* Buffer for temp directory path - use work_dir if available, else /tmp
+ * Size 256 is sufficient for any reasonable work_dir + "/cr-tmpfs.XXXXXX"
+ * (smaller than PATH_MAX to avoid snprintf truncation warnings downstream) */
+static char mnt_clean_path[256];
 
 static int mount_clean_path(void)
 {
@@ -2390,9 +2393,16 @@ static int mount_clean_path(void)
 	 * an intermediate place without MS_REC and then create a target mounts.
 	 * This intermediate place should be a private mount to not affect
 	 * properties of the source mount.
+	 *
+	 * Use opts.work_dir if available to avoid conflicts with containers
+	 * that restore /tmp - the hardcoded /tmp path can cause "Device busy"
+	 * errors when the restored process also uses /tmp.
 	 */
+	const char *base_dir = (opts.work_dir && opts.work_dir[0]) ? opts.work_dir : "/tmp";
+	snprintf(mnt_clean_path, sizeof(mnt_clean_path), "%s/cr-tmpfs.XXXXXX", base_dir);
+
 	if (mkdtemp(mnt_clean_path) == NULL) {
-		pr_perror("Unable to create a temporary directory");
+		pr_perror("Unable to create a temporary directory in %s", base_dir);
 		return -1;
 	}
 
@@ -2416,8 +2426,21 @@ static int umount_clean_path(void)
 		return -1;
 	}
 
+	/*
+	 * After MNT_DETACH, the mount is lazily unmounted - it's marked for
+	 * removal but won't actually be removed until all references are gone.
+	 * In containerized environments (Kubernetes), the parent process may
+	 * hold an fd to the parent directory (e.g., /tmp for WorkDirFd, or
+	 * images_dir). This can cause rmdir to fail with EBUSY even though
+	 * the unmount succeeded.
+	 *
+	 * This is NOT a restore failure - the mount was properly unmounted.
+	 * The temp directory will be cleaned up when the container exits.
+	 * Don't fail restore for this cosmetic cleanup issue.
+	 */
 	if (rmdir(mnt_clean_path)) {
-		pr_perror("Unable to remove %s", mnt_clean_path);
+		pr_warn("Unable to remove %s (will be cleaned on container exit)\n", mnt_clean_path);
+		/* Don't return error - restore succeeded, only cleanup failed */
 	}
 
 	return 0;

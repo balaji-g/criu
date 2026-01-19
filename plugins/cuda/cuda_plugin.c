@@ -11,6 +11,7 @@
 #include <compel/infect.h>
 
 #include <ctype.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -48,6 +49,9 @@ typedef enum {
 bool plugin_disabled = false;
 
 bool plugin_added_to_inventory = false;
+
+/* Forward declarations */
+static int scan_and_save_nvidia_fds(int pid);
 
 struct pid_info {
 	int pid;
@@ -455,6 +459,13 @@ int cuda_plugin_pause_devices(int pid)
 		plugin_added_to_inventory = true;
 	}
 
+	/*
+	 * Scan and save NVIDIA device FDs BEFORE cuda-checkpoint runs.
+	 * This is critical because cuda-checkpoint will close/modify these FDs,
+	 * and CRIU won't see them during its later FD collection phase.
+	 */
+	scan_and_save_nvidia_fds(pid);
+
 	if (task_state == CUDA_TASK_LOCKED) {
 		pr_info("pid %d already in a locked state\n", pid);
 		/* Leave this PID in a "locked" state at resume_device() */
@@ -753,11 +764,53 @@ static bool is_nvidia_device_major(unsigned int maj)
 #define NVIDIA_FILES_IMG "nvidia-files.img"
 static FILE *nvidia_files_fp = NULL;
 
+/*
+ * Get the directory path for checkpoint images (nvidia-files.img).
+ * 
+ * During RPC mode:
+ * - opts.imgs_dir is set from ImagesDirFd (checkpoint directory)
+ * - opts.work_dir is set from WorkDirFd (could be /tmp for temp mounts)
+ * 
+ * We MUST prefer opts.imgs_dir because that's where checkpoint images live.
+ * WorkDirFd might point to a different directory just for temp files.
+ * 
+ * Falls back to CWD as last resort (CRIU chdir's during dump).
+ */
+static const char *get_images_dir(void)
+{
+	/* Primary: images directory (where checkpoint data lives) */
+	if (opts.imgs_dir && opts.imgs_dir[0]) {
+		pr_debug("CUDA plugin: using opts.imgs_dir=%s\n", opts.imgs_dir);
+		return opts.imgs_dir;
+	}
+	
+	/* 
+	 * Fallback: work directory (only if imgs_dir is truly empty).
+	 * During dump via RPC, work_dir may equal imgs_dir.
+	 * During restore, work_dir might be /tmp - AVOID this for images!
+	 */
+	if (opts.work_dir && opts.work_dir[0] && 
+	    strncmp(opts.work_dir, "/tmp", 4) != 0) {
+		pr_debug("CUDA plugin: using opts.work_dir=%s (imgs_dir empty)\n", opts.work_dir);
+		return opts.work_dir;
+	}
+	
+	/* Last resort: current directory (CRIU chdir's to images during dump) */
+	pr_debug("CUDA plugin: using CWD (imgs_dir=%s, work_dir=%s)\n",
+		opts.imgs_dir ? opts.imgs_dir : "null",
+		opts.work_dir ? opts.work_dir : "null");
+	return ".";
+}
+
 static void save_nvidia_file_mapping(int id, const char *path)
 {
 	if (!nvidia_files_fp) {
 		char img_path[PATH_MAX];
-		snprintf(img_path, sizeof(img_path), "%s/%s", opts.imgs_dir, NVIDIA_FILES_IMG);
+		const char *dir = get_images_dir();
+		
+		snprintf(img_path, sizeof(img_path), "%s/%s", dir, NVIDIA_FILES_IMG);
+		pr_info("CUDA plugin: saving NVIDIA mappings to %s (dir=%s)\n", img_path, dir);
+		
 		nvidia_files_fp = fopen(img_path, "w");
 		if (!nvidia_files_fp) {
 			pr_perror("Failed to create %s", img_path);
@@ -767,6 +820,80 @@ static void save_nvidia_file_mapping(int id, const char *path)
 	fprintf(nvidia_files_fp, "%d %s\n", id, path);
 	fflush(nvidia_files_fp);
 	pr_debug("CUDA plugin: saved mapping id=0x%x -> %s\n", id, path);
+}
+
+/*
+ * Scan a process's file descriptors for NVIDIA devices and save mappings.
+ * This MUST be called BEFORE cuda-checkpoint closes the device FDs.
+ * 
+ * The id format uses FD number + device info to create a unique identifier
+ * that can be matched during restore.
+ */
+static int scan_and_save_nvidia_fds(int pid)
+{
+	char fd_dir[64];
+	DIR *dir;
+	struct dirent *entry;
+	int count = 0;
+	
+	snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+	dir = opendir(fd_dir);
+	if (!dir) {
+		pr_perror("CUDA plugin: failed to open %s", fd_dir);
+		return -1;
+	}
+	
+	while ((entry = readdir(dir)) != NULL) {
+		char fd_path[128];
+		char link_target[256];
+		struct stat st;
+		ssize_t len;
+		int fd_num;
+		
+		if (entry->d_name[0] == '.')
+			continue;
+		
+		fd_num = atoi(entry->d_name);
+		snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%d", pid, fd_num);
+		
+		/* Read the symlink to get the device path */
+		len = readlink(fd_path, link_target, sizeof(link_target) - 1);
+		if (len <= 0)
+			continue;
+		link_target[len] = '\0';
+		
+		/* Check if it's an NVIDIA device */
+		if (strncmp(link_target, "/dev/nvidia", 11) != 0)
+			continue;
+		
+		/* Stat the actual device to get major/minor */
+		if (stat(link_target, &st) < 0) {
+			pr_warn("CUDA plugin: can't stat %s\n", link_target);
+			continue;
+		}
+		
+		if (!S_ISCHR(st.st_mode))
+			continue;
+		
+		/* Create a unique ID from major:minor:fd */
+		unsigned int maj = major(st.st_rdev);
+		unsigned int min = minor(st.st_rdev);
+		int id = (maj << 20) | (min << 8) | (fd_num & 0xFF);
+		
+		save_nvidia_file_mapping(id, link_target);
+		count++;
+		
+		pr_debug("CUDA plugin: found NVIDIA fd %d -> %s (id=0x%x)\n", 
+			fd_num, link_target, id);
+	}
+	
+	closedir(dir);
+	
+	if (count > 0) {
+		pr_info("CUDA plugin: saved %d NVIDIA device mappings for pid %d\n", count, pid);
+	}
+	
+	return count;
 }
 
 int cuda_plugin_dump_file(int fd, int id)
@@ -783,6 +910,18 @@ int cuda_plugin_dump_file(int fd, int id)
 	/* Check if this is a character device with an NVIDIA major */
 	if (!S_ISCHR(st.st_mode) || !is_nvidia_device_major(major(st.st_rdev))) {
 		return -ENOTSUP; /* Not an NVIDIA device */
+	}
+
+	/*
+	 * Register this plugin in the inventory so CRIU knows to load it
+	 * during restore. This is critical - without it, the plugin will
+	 * be disabled during restore and external files won't be restored.
+	 */
+	if (!plugin_added_to_inventory) {
+		if (add_inventory_plugin(CR_PLUGIN_DESC.name))
+			return -1;
+		plugin_added_to_inventory = true;
+		pr_info("CUDA plugin: added to inventory for DUMP_EXT_FILE\n");
 	}
 
 	/* Get the actual device path */
@@ -832,15 +971,20 @@ static void load_nvidia_file_mappings(void)
 	FILE *fp;
 	int id;
 	char path[256];
+	const char *dir;
 
 	if (nvidia_file_map_loaded)
 		return;
 	nvidia_file_map_loaded = true;
 
-	snprintf(img_path, sizeof(img_path), "%s/%s", opts.imgs_dir, NVIDIA_FILES_IMG);
+	dir = get_images_dir();
+	snprintf(img_path, sizeof(img_path), "%s/%s", dir, NVIDIA_FILES_IMG);
+	pr_info("CUDA plugin: loading NVIDIA mappings from %s (dir=%s)\n", img_path, dir);
+	
 	fp = fopen(img_path, "r");
 	if (!fp) {
-		pr_debug("CUDA plugin: no %s found, using fallback restore\n", NVIDIA_FILES_IMG);
+		pr_warn("CUDA plugin: no %s found at %s, using fallback restore\n", 
+			NVIDIA_FILES_IMG, img_path);
 		return;
 	}
 

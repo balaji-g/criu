@@ -101,10 +101,10 @@ struct io_uring_params {
 
 /* Setup flags for element size variants */
 #ifndef IORING_SETUP_SQE128
-#define IORING_SETUP_SQE128	(1U << 8)  /* 128-byte SQEs (NVMe passthrough) */
+#define IORING_SETUP_SQE128	(1U << 10)  /* 128-byte SQEs - bit 10, NOT bit 8 */
 #endif
 #ifndef IORING_SETUP_CQE32
-#define IORING_SETUP_CQE32	(1U << 9)  /* 32-byte CQEs (NVMe passthrough) */
+#define IORING_SETUP_CQE32	(1U << 11)  /* 32-byte CQEs - bit 11, NOT bit 9 */
 #endif
 
 /* Element sizes */
@@ -133,6 +133,7 @@ struct io_uring_fdinfo {
 	int32_t sq_thread_cpu;
 	uint32_t user_files;
 	uint32_t user_bufs;
+	uint32_t flags;		/* io_uring setup flags from kernel fdinfo */
 };
 
 /*
@@ -250,6 +251,7 @@ static int parse_io_uring_fdinfo(int proc_fd, int fd, struct io_uring_fdinfo *in
 		else if (!strcmp(buf, "SqThreadCpu")) info->sq_thread_cpu = strtol(value, NULL, 0);
 		else if (!strcmp(buf, "UserFiles")) info->user_files = strtoul(value, NULL, 0);
 		else if (!strcmp(buf, "UserBufs")) info->user_bufs = strtoul(value, NULL, 0);
+		else if (!strcmp(buf, "Flags")) info->flags = strtoul(value, NULL, 0);
 	}
 
 	fclose(f);
@@ -498,18 +500,26 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		entry->id = fd;
 		entry->ino = vma->vm_iouring_ino;
 		/*
-		 * Note: The kernel's io_uring fdinfo doesn't expose SqMask/CqMask.
-		 * We compute sq_entries from the SQEs VMA size: size / 64 bytes per SQE.
-		 * We'll update these values after processing all VMAs for this io_uring.
+		 * Note: sq_entries and cq_entries are computed from VMA sizes later.
 		 * For now, set them to 0 as placeholder.
 		 */
 		entry->sq_entries = 0;
 		entry->cq_entries = 0;
-		entry->flags = 0;
+
+		/*
+		 * PROPER FIX: Use flags directly from kernel fdinfo (Linux 5.12+).
+		 * This is the authoritative source - no guessing from VMA sizes!
+		 */
+		entry->flags = fdinfo.flags;
+		pr_info("io_uring fd %d: flags from fdinfo = 0x%x\n", fd, fdinfo.flags);
 
 #define IORING_SETUP_SQPOLL (1U << 1)
 		if (fdinfo.sq_thread >= 0) {
-			entry->flags |= IORING_SETUP_SQPOLL;
+			/* SQPOLL should already be in fdinfo.flags, but ensure it */
+			if (!(entry->flags & IORING_SETUP_SQPOLL)) {
+				pr_warn("io_uring fd %d: SQPOLL thread exists but flag missing, adding\n", fd);
+				entry->flags |= IORING_SETUP_SQPOLL;
+			}
 			pr_warn("io_uring fd %d has SQPOLL (thread=%d cpu=%d)\n",
 			       fd, fdinfo.sq_thread, fdinfo.sq_thread_cpu);
 			pr_warn("  WARNING: SQPOLL kernel thread will be RECREATED on restore.\n");
@@ -593,33 +603,27 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		 * This is reliable because kernel exposes it directly.
 		 *
 		 * Fallback: compute from VMA size / SQE size.
-		 * Note: SQE size is normally 64 bytes, but IORING_SETUP_SQE128
-		 * uses 128-byte SQEs. We detect this by checking if the VMA
-		 * size makes sense with either size.
+		 * IMPORTANT: Use the flags from fdinfo to determine SQE size.
+		 * Don't guess - we have the authoritative flags!
 		 */
 		if (entry->sq_mask > 0) {
 			/* Use mask from fdinfo (reliable) */
 			entry->sq_entries = entry->sq_mask + 1;
 		} else if (entry->sqe_size > 0) {
 			/*
-			 * Infer SQE size from VMA size:
-			 * - Standard: VMA = entries * 64
-			 * - SQE128:   VMA = entries * 128
-			 * Check which one gives a power-of-2 result.
+			 * Compute entries from VMA size using the KNOWN SQE size
+			 * from flags (which came from fdinfo - authoritative!)
 			 */
-			uint32_t entries_64 = entry->sqe_size / SIZEOF_SQE_NORMAL;
-			uint32_t entries_128 = entry->sqe_size / SIZEOF_SQE_128;
+			uint32_t sqe_size = get_sqe_size_for_flags(entry->flags);
+			uint32_t entries = entry->sqe_size / sqe_size;
 			
-			if (entries_128 > 0 && (entries_128 & (entries_128 - 1)) == 0 &&
-			    entries_128 * SIZEOF_SQE_128 == entry->sqe_size) {
-				/* SQE128 mode - set flag */
-				entry->flags |= IORING_SETUP_SQE128;
-				entry->sq_entries = entries_128;
-				pr_info("  Detected SQE128 mode: %u entries\n", entries_128);
-			} else if (entries_64 > 0) {
-				entry->sq_entries = entries_64;
+			if (entries > 0 && (entries & (entries - 1)) == 0) {
+				entry->sq_entries = entries;
+				pr_info("  SQ entries: %u (VMA size=%lu / SQE size=%u, flags=0x%x)\n",
+					entries, (unsigned long)entry->sqe_size, sqe_size, entry->flags);
 			} else {
 				entry->sq_entries = 32; /* fallback */
+				pr_warn("  Could not compute SQ entries from VMA, using fallback: 32\n");
 			}
 		} else {
 			/* Try to find SQEs from vmas array */
@@ -630,7 +634,14 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 				    entry->vmas[k]->size > sqe_vma_size)
 					sqe_vma_size = entry->vmas[k]->size;
 			}
-			entry->sq_entries = sqe_vma_size > 0 ? sqe_vma_size / SIZEOF_SQE_NORMAL : 32;
+			if (sqe_vma_size > 0) {
+				uint32_t sqe_size = get_sqe_size_for_flags(entry->flags);
+				entry->sq_entries = sqe_vma_size / sqe_size;
+				pr_info("  SQ entries (from vmas): %u (VMA size=%zu / SQE size=%u)\n",
+					entry->sq_entries, sqe_vma_size, sqe_size);
+			} else {
+				entry->sq_entries = 32;
+			}
 		}
 		
 		/* CQ entries: use mask if available, otherwise 2x SQ entries */
