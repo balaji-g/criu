@@ -321,6 +321,10 @@ static int resolve_images_dir_path(char *images_dir_path,
 			/* Set opts.imgs_dir so plugins can find checkpoint files */
 			xfree(opts.imgs_dir);
 			opts.imgs_dir = xstrdup(resolved);
+			if (!opts.imgs_dir) {
+				pr_err("Can't allocate imgs_dir path\n");
+				return -1;
+			}
 			pr_debug("Resolved images_dir_fd to %s, set opts.imgs_dir\n", resolved);
 		} else {
 			/* Fallback: use /proc/fd path directly (may work for some operations) */
