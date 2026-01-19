@@ -3733,10 +3733,15 @@ int depopulate_roots_yard(int mntns_fd, bool only_ghosts)
 		return -1;
 	}
 	if (setns(mntns_fd, CLONE_NEWNS) < 0) {
-		pr_perror("`- Can't switch");
+		/*
+		 * Can't switch to container mntns - this happens with hostPID restore.
+		 * Not fatal: the actual restore succeeded, this is just cleanup.
+		 * Ghost files/remaps may not be cleaned up, but processes are running.
+		 */
+		pr_warn("`- Can't switch to mntns for cleanup (hostPID?): %s\n", strerror(errno));
 		close(old_ns);
 		close(old_cwd);
-		return -1;
+		return 0;  /* Non-fatal: restore succeeded, cleanup skipped */
 	}
 
 	if (try_clean_remaps(only_ghosts))
