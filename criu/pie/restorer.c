@@ -1155,8 +1155,13 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	 * - libuv/uvloop uses direct io_uring_enter syscalls
 	 * - This works correctly after restore
 	 * - SQPOLL is just an optimization, not required for correctness
+	 *
+	 * IMPORTANT: After stripping SQPOLL, we MUST set IORING_SQ_NEED_WAKEUP
+	 * in sqflags to make libuv call io_uring_enter for submissions.
+	 * See the code after ring index synchronization below.
 	 */
 #define IORING_SETUP_SQPOLL (1U << 1)
+	int sqpoll_was_stripped = 0;
 	if (params.flags & IORING_SETUP_SQPOLL) {
 		pr_warn("  STRIPPING SQPOLL flag for checkpoint/restore compatibility!\n");
 		pr_warn("  Original flags: 0x%x -> New flags: 0x%x\n",
@@ -1165,6 +1170,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		/* Clear SQPOLL-related params since we're not using SQPOLL */
 		params.sq_thread_cpu = 0;
 		params.sq_thread_idle = 0;
+		sqpoll_was_stripped = 1;
 	}
 
 	/* Create a new io_uring instance */
@@ -1370,6 +1376,33 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 
 		pr_info("  Synchronized: sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u (rings empty)\n",
 			*sq_head, *sq_tail, *cq_head, *cq_tail);
+
+		/*
+		 * CRITICAL FIX: Set IORING_SQ_NEED_WAKEUP to compensate for stripped SQPOLL!
+		 *
+		 * Without SQPOLL, there's no kernel thread to poll the submission queue.
+		 * libuv checks sqflags for IORING_SQ_NEED_WAKEUP before calling io_uring_enter:
+		 *
+		 *   flags = atomic_load(iou->sqflags);
+		 *   if (flags & IORING_SQ_NEED_WAKEUP)
+		 *       io_uring_enter(ringfd, 0, 0, IORING_ENTER_SQ_WAKEUP);
+		 *
+		 * If we don't set this flag, libuv won't call io_uring_enter for submissions,
+		 * and submissions will NEVER be processed (causing eventual EBADF crash).
+		 *
+		 * By setting NEED_WAKEUP permanently, libuv will call io_uring_enter for
+		 * every submission, which is correct behavior for non-SQPOLL mode.
+		 * The flag stays set because without SQPOLL, kernel doesn't manage sqflags.
+		 */
+#define IORING_SQ_NEED_WAKEUP (1U << 0)
+		if (sqpoll_was_stripped) {
+			volatile uint32_t *sqflags = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.flags);
+			uint32_t old_flags = *sqflags;
+			*sqflags |= IORING_SQ_NEED_WAKEUP;
+			pr_info("  SQPOLL compensation: set NEED_WAKEUP in sqflags (0x%x -> 0x%x)\n",
+				old_flags, *sqflags);
+			pr_info("  This ensures libuv calls io_uring_enter for all submissions\n");
+		}
 	}
 
 	/* If the fd doesn't match, dup2 it to the expected fd */
