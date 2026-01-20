@@ -860,13 +860,6 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 	int flags = vma_entry->flags | MAP_FIXED;
 	unsigned long addr;
 
-	/*
-	 * io_uring VMAs are already mapped in precreate_io_urings().
-	 * Skip them here to avoid overwriting the io_uring ring buffers.
-	 */
-	if (vma_entry_is(vma_entry, VMA_AREA_IOURING))
-		return vma_entry->start;
-
 	if (vma_entry_is(vma_entry, VMA_AREA_SYSVIPC)) {
 		int att_flags;
 		void *shmaddr = decode_pointer(vma_entry->start);
@@ -1075,27 +1068,8 @@ populate:
 #define IORING_FEAT_FAST_POLL		(1U << 5)
 #define IORING_FEAT_POLL_32BITS		(1U << 6)
 
-/* Setup flags for element size variants */
-#define IORING_SETUP_SQE128		(1U << 10)  /* 128-byte SQEs - bit 10, NOT bit 8 */
-#define IORING_SETUP_CQE32		(1U << 11)  /* 32-byte CQEs - bit 11, NOT bit 9 */
-
-/* Default element sizes */
-#define SIZEOF_IO_URING_SQE	64	/* Standard SQE size */
-#define SIZEOF_IO_URING_CQE	16	/* Standard CQE size */
-#define SIZEOF_IO_URING_SQE128	128	/* Extended SQE size */
-#define SIZEOF_IO_URING_CQE32	32	/* Extended CQE size */
-
-/* Get actual SQE size based on flags */
-static inline unsigned int get_sqe_size(unsigned int flags)
-{
-	return (flags & IORING_SETUP_SQE128) ? SIZEOF_IO_URING_SQE128 : SIZEOF_IO_URING_SQE;
-}
-
-/* Get actual CQE size based on flags */
-static inline unsigned int get_cqe_size(unsigned int flags)
-{
-	return (flags & IORING_SETUP_CQE32) ? SIZEOF_IO_URING_CQE32 : SIZEOF_IO_URING_CQE;
-}
+/* Size of io_uring_cqe structure (16 bytes) */
+#define SIZEOF_IO_URING_CQE	16
 
 /*
  * io_uring setup parameters (from linux/io_uring.h)
@@ -1160,14 +1134,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	unsigned long sq_ring_size, cq_ring_size, sqe_size;
 	int single_mmap;
 
-	pr_info("io_uring: restore_io_uring_ring called, ring ptr=%p\n", ring);
-
-	if (!ring) {
-		pr_err("io_uring: ring pointer is NULL!\n");
-		return -1;
-	}
-
-	pr_info("io_uring: Restoring ring: fd=%u sq=%u cq=%u sq_addr=0x%lx sq_size=%lu sqe_addr=0x%lx sqe_size=%lu\n",
+	pr_info("Restoring io_uring ring: fd=%u sq=%u cq=%u sq_addr=0x%lx sq_size=%lu sqe_addr=0x%lx sqe_size=%lu\n",
 		ring->fd, ring->sq_entries, ring->cq_entries,
 		ring->sq_ring_addr, ring->sq_ring_size,
 		ring->sqe_addr, ring->sqe_size);
@@ -1175,165 +1142,35 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	/* Set up the ring configuration */
 	params.sq_entries = ring->sq_entries;
 	params.cq_entries = ring->cq_entries;
+	params.flags = ring->flags;
+
 	/*
-	 * io_uring flag definitions for restore.
-	 * SQPOLL MUST be preserved - it creates a kernel polling thread.
-	 * Without SQPOLL, uvloop/libuv will fail with EOPNOTSUPP.
-	 * The kernel will create a NEW SQPOLL thread on restore - that's correct.
+	 * CRITICAL: Strip SQPOLL flag during restore!
 	 *
-	 * We strip flags that may not be supported on older kernels:
-	 * - COOP_TASKRUN (0x100) - added in Linux 5.19
-	 * - TASKRUN_FLAG (0x200) - added in Linux 5.19
-	 * - SQE128 (0x400) - added in Linux 5.19
-	 * - CQE32 (0x800) - added in Linux 5.19
-	 * - SINGLE_ISSUER (0x1000) - added in Linux 6.0
-	 * - DEFER_TASKRUN (0x2000) - added in Linux 6.1
+	 * SQPOLL creates a kernel polling thread that CRIU cannot properly
+	 * checkpoint/restore. After restore, the SQPOLL thread is in an
+	 * inconsistent state, causing EOPNOTSUPP errors.
+	 *
+	 * Without SQPOLL:
+	 * - libuv/uvloop uses direct io_uring_enter syscalls
+	 * - This works correctly after restore
+	 * - SQPOLL is just an optimization, not required for correctness
 	 */
-#define IORING_SETUP_SQPOLL_RST       (1U << 1)
-#define IORING_SETUP_CQSIZE_RST       (1U << 3)
-#define IORING_SETUP_COOP_TASKRUN_RST (1U << 8)
-#define IORING_SETUP_TASKRUN_FLAG_RST (1U << 9)
-#define IORING_SETUP_SQE128_RST       (1U << 10)
-#define IORING_SETUP_CQE32_RST        (1U << 11)
-#define IORING_SETUP_SINGLE_ISSUER_RST (1U << 12)
-#define IORING_SETUP_DEFER_TASKRUN_RST (1U << 13)
-
-	/*
-	 * Strip flags that may not be supported on older kernels (5.15).
-	 * NOTE: SQPOLL is NOT stripped - it's required for uvloop to work.
-	 * NOTE: SQE128/CQE32 are NOT stripped - they change memory layout!
-	 *       Stripping them causes 128-byte SQEs to become 64-byte,
-	 *       corrupting memory when app accesses SQE[1] at offset 128.
-	 * These are kernel version dependent and will cause EINVAL on older kernels.
-	 */
-#define IORING_STRIP_UNSUPPORTED_FLAGS ( \
-	IORING_SETUP_COOP_TASKRUN_RST |  \
-	IORING_SETUP_TASKRUN_FLAG_RST |  \
-	IORING_SETUP_SINGLE_ISSUER_RST | \
-	IORING_SETUP_DEFER_TASKRUN_RST   \
-)
-	params.flags = ring->flags & ~IORING_STRIP_UNSUPPORTED_FLAGS;
-	/*
-	 * If we have a custom cq_entries, we MUST set IORING_SETUP_CQSIZE flag,
-	 * otherwise the kernel will return EINVAL.
-	 */
-	if (ring->cq_entries > 0) {
-		params.flags |= IORING_SETUP_CQSIZE_RST;
-	}
-	pr_info("  io_uring setup: orig_flags=0x%x final_flags=0x%x sq=%u cq=%u\n",
-		ring->flags, params.flags, params.sq_entries, params.cq_entries);
-	{
-		unsigned int stripped = ring->flags & IORING_STRIP_UNSUPPORTED_FLAGS;
-		if (stripped) {
-			pr_info("  Stripped unsupported flags: 0x%x (COOP=%d TASKRUN=%d SINGLE=%d DEFER=%d)\n",
-				stripped,
-				!!(stripped & IORING_SETUP_COOP_TASKRUN_RST),
-				!!(stripped & IORING_SETUP_TASKRUN_FLAG_RST),
-				!!(stripped & IORING_SETUP_SINGLE_ISSUER_RST),
-				!!(stripped & IORING_SETUP_DEFER_TASKRUN_RST));
-		}
-		/* SQE128 and CQE32 are preserved (memory layout flags) */
-		if (ring->flags & (IORING_SETUP_SQE128_RST | IORING_SETUP_CQE32_RST)) {
-			pr_info("  Preserving memory layout flags: SQE128=%d CQE32=%d\n",
-				!!(ring->flags & IORING_SETUP_SQE128_RST),
-				!!(ring->flags & IORING_SETUP_CQE32_RST));
-		}
-		if (ring->flags & IORING_SETUP_SQPOLL_RST) {
-			pr_info("  SQPOLL flag preserved - kernel will create new polling thread\n");
-		}
+#define IORING_SETUP_SQPOLL (1U << 1)
+	if (params.flags & IORING_SETUP_SQPOLL) {
+		pr_warn("  STRIPPING SQPOLL flag for checkpoint/restore compatibility!\n");
+		pr_warn("  Original flags: 0x%x -> New flags: 0x%x\n",
+			params.flags, params.flags & ~IORING_SETUP_SQPOLL);
+		params.flags &= ~IORING_SETUP_SQPOLL;
+		/* Clear SQPOLL-related params since we're not using SQPOLL */
+		params.sq_thread_cpu = 0;
+		params.sq_thread_idle = 0;
 	}
 
-	/*
-	 * Only set SQPOLL-related params if SQPOLL is actually in final flags.
-	 * Setting these without SQPOLL flag causes EINVAL.
-	 */
-	if (params.flags & IORING_SETUP_SQPOLL_RST) {
-		if (ring->sq_thread_cpu >= 0) {
-			params.sq_thread_cpu = ring->sq_thread_cpu;
-		}
-		if (ring->sq_thread_idle > 0) {
-			params.sq_thread_idle = ring->sq_thread_idle;
-		}
-		pr_debug("  SQPOLL enabled: cpu=%d idle=%u\n",
-			 ring->sq_thread_cpu, ring->sq_thread_idle);
-	}
-
-	/*
-	 * DIAGNOSTIC: Print full params struct before io_uring_setup call.
-	 * This helps diagnose EINVAL errors by showing exactly what we're passing.
-	 */
-	pr_info("  io_uring_setup FULL PARAMS DUMP:\n");
-	pr_info("    sq_entries:     %u\n", params.sq_entries);
-	pr_info("    cq_entries:     %u\n", params.cq_entries);
-	pr_info("    flags:          0x%x\n", params.flags);
-	pr_info("    sq_thread_cpu:  %u\n", params.sq_thread_cpu);
-	pr_info("    sq_thread_idle: %u\n", params.sq_thread_idle);
-	pr_info("    features:       0x%x (input, should be 0)\n", params.features);
-	pr_info("    wq_fd:          %u\n", params.wq_fd);
-	pr_info("    resv[0-2]:      %u %u %u\n", params.resv[0], params.resv[1], params.resv[2]);
-	pr_info("    sq_off (pre):   head=%u tail=%u\n", params.sq_off.head, params.sq_off.tail);
-	pr_info("    cq_off (pre):   head=%u tail=%u\n", params.cq_off.head, params.cq_off.tail);
-
-	/*
-	 * DIAGNOSTIC: Try a minimal io_uring_setup first to verify kernel support.
-	 * This helps distinguish between "kernel doesn't support io_uring" vs
-	 * "our specific parameters are invalid".
-	 */
-	{
-		struct io_uring_params_rst test_params = { 0 };
-		int test_fd;
-
-		pr_info("  PROBE: Testing minimal io_uring_setup(8, {0})...\n");
-		test_fd = sys_io_uring_setup(8, &test_params);
-		if (test_fd < 0) {
-			pr_err("  PROBE FAILED: Minimal io_uring_setup returned %d\n", test_fd);
-			pr_err("  This kernel may not support io_uring at all.\n");
-		} else {
-			pr_info("  PROBE OK: Minimal io_uring works. Kernel features=0x%x\n",
-				test_params.features);
-			sys_close(test_fd);
-
-			/* Now test with CQSIZE flag specifically */
-			test_params = (struct io_uring_params_rst){ 0 };
-			test_params.flags = IORING_SETUP_CQSIZE_RST;
-			test_params.cq_entries = 16;
-			pr_info("  PROBE: Testing io_uring_setup with CQSIZE flag...\n");
-			test_fd = sys_io_uring_setup(8, &test_params);
-			if (test_fd < 0) {
-				pr_err("  PROBE FAILED: CQSIZE flag returned %d - kernel may not support it\n",
-				       test_fd);
-				pr_err("  Will retry without CQSIZE flag.\n");
-				params.flags &= ~IORING_SETUP_CQSIZE_RST;
-				params.cq_entries = 0;  /* Let kernel choose */
-			} else {
-				pr_info("  PROBE OK: CQSIZE flag supported.\n");
-				sys_close(test_fd);
-			}
-		}
-	}
-
-	/* Create the io_uring instance */
-	pr_info("  Calling sys_io_uring_setup(%u, &params) with flags=0x%x cq=%u...\n",
-		ring->sq_entries, params.flags, params.cq_entries);
+	/* Create a new io_uring instance */
 	fd = sys_io_uring_setup(ring->sq_entries, &params);
 	if (fd < 0) {
-		pr_err("io_uring_setup failed: %d (errno interpretation: %s)\n", fd,
-		       fd == -22 ? "EINVAL - invalid argument" :
-		       fd == -12 ? "ENOMEM - out of memory" :
-		       fd == -1 ? "EPERM - permission denied" :
-		       fd == -38 ? "ENOSYS - not implemented" : "unknown");
-		pr_err("  sq_entries=%u, cq_entries=%u, flags=0x%x\n",
-		       ring->sq_entries, params.cq_entries, params.flags);
-		pr_err("  Possible causes of EINVAL:\n");
-		pr_err("    - sq_entries not power of 2 (is %u power of 2? %s)\n",
-		       ring->sq_entries, 
-		       (ring->sq_entries & (ring->sq_entries - 1)) == 0 ? "yes" : "NO");
-		pr_err("    - cq_entries not power of 2 when CQSIZE set (is %u power of 2? %s)\n",
-		       params.cq_entries,
-		       params.cq_entries == 0 || (params.cq_entries & (params.cq_entries - 1)) == 0 ? "yes" : "NO");
-		pr_err("    - flags contain unsupported bits (flags=0x%x)\n", params.flags);
-		pr_err("    - resv[] fields not zero (resv=%u,%u,%u)\n",
-		       params.resv[0], params.resv[1], params.resv[2]);
+		pr_err("io_uring_setup failed: %d\n", fd);
 		return -1;
 	}
 
@@ -1355,14 +1192,10 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	 * Calculate proper mmap sizes from kernel-returned params.
 	 * SQ ring size = sq_off.array + sq_entries * sizeof(unsigned)
 	 * CQ ring size = cq_off.cqes + cq_entries * sizeof(io_uring_cqe)
-	 *
-	 * Note: Element sizes depend on setup flags:
-	 *   - IORING_SETUP_SQE128: 128-byte SQEs (for NVMe passthrough)
-	 *   - IORING_SETUP_CQE32: 32-byte CQEs (for NVMe passthrough)
 	 */
 	sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(__u32);
-	cq_ring_size = params.cq_off.cqes + params.cq_entries * get_cqe_size(ring->flags);
-	sqe_size = params.sq_entries * get_sqe_size(ring->flags);
+	cq_ring_size = params.cq_off.cqes + params.cq_entries * SIZEOF_IO_URING_CQE;
+	sqe_size = params.sq_entries * 64;  /* sizeof(io_uring_sqe) = 64 */
 
 	/* Page align */
 	sq_ring_size = io_uring_align_up(sq_ring_size);
@@ -1456,38 +1289,14 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 
 	/* Map SQEs at the target address */
 	if (ring->sqe_addr) {
-		/*
-		 * The SQE (Submission Queue Entry) array is mapped separately from
-		 * the SQ/CQ rings. It uses IORING_OFF_SQES offset.
-		 *
-		 * Key insight: The kernel determines the sqe_size based on sq_entries
-		 * returned from io_uring_setup, NOT what we request. We must use
-		 * the kernel's expected size which is: sq_entries * sizeof(io_uring_sqe)
-		 * where io_uring_sqe is 64 bytes (or 128 with SQE128 flag).
-		 *
-		 * Actually, the kernel's mmap handler for SQES uses:
-		 *   size = rings->sq_entries * sizeof(struct io_uring_sqe)
-		 * and compares against the requested length. If they don't match
-		 * within page alignment, EINVAL is returned.
-		 */
-		unsigned long kernel_sqe_size = params.sq_entries * get_sqe_size(params.flags);
-		kernel_sqe_size = io_uring_align_up(kernel_sqe_size);
-
-		pr_info("  Mapping SQEs: checkpointed_addr=0x%lx checkpointed_size=%lu\n",
-			ring->sqe_addr, ring->sqe_size);
-		pr_info("  Mapping SQEs: kernel_sq_entries=%u sqe_element_size=%u kernel_sqe_size=%lu our_calc=%lu\n",
-			params.sq_entries, get_sqe_size(params.flags), kernel_sqe_size, sqe_size);
-
-		/* Use kernel's expected size, not our calculated one */
-		sqe_size = kernel_sqe_size;
-
 		/* Unmap target range first */
 		ret = sys_munmap((void *)ring->sqe_addr, sqe_size);
 		if (ret < 0 && ret != -ENOMEM) {
 			pr_warn("  munmap of target sqe_addr failed: %ld (continuing)\n", ret);
 		}
 
-		pr_info("  Mapping SQEs at 0x%lx (size=%lu)\n", ring->sqe_addr, sqe_size);
+		pr_info("  Mapping SQEs at 0x%lx (kernel size=%lu, checkpointed=%lu)\n",
+			ring->sqe_addr, sqe_size, ring->sqe_size);
 
 		/* Map at target address */
 		sqe_ptr = (void *)sys_mmap((void *)ring->sqe_addr, sqe_size,
@@ -1497,8 +1306,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		if (IS_ERR(sqe_ptr)) {
 			pr_err("Failed to mmap SQEs at 0x%lx (size=%lu): %ld\n",
 			       ring->sqe_addr, sqe_size, PTR_ERR(sqe_ptr));
-			/* Try without MAP_FIXED - if this also fails, it's a size/offset issue */
-			pr_info("  Trying mmap without MAP_FIXED to diagnose...\n");
+			/* Try without MAP_FIXED */
 			sqe_ptr = (void *)sys_mmap(NULL, sqe_size,
 						   PROT_READ | PROT_WRITE,
 						   MAP_SHARED,
@@ -1525,50 +1333,43 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		}
 	}
 
-
 	/*
-	 * IMPORTANT: Synchronize kernel ring indices with application's cached state!
+	 * CRITICAL: Synchronize ring indices with application's cached state!
 	 *
-	 * After restore, the kernel's io_uring is FRESH (new ring from setup).
-	 * But the application (uvloop/libuv) has CACHED indices in its heap memory
-	 * from the checkpoint. If these don't match, operations will fail.
+	 * The kernel's new io_uring starts with all indices at 0, but libuv
+	 * has cached values in its heap memory from the checkpoint.
+	 * If these don't match, io_uring operations will fail.
 	 *
-	 * The fix: Set kernel indices to match checkpointed values, but in EMPTY state:
-	 * - SQ: head = tail = checkpointed tail (empty submission queue)
-	 * - CQ: head = tail = checkpointed head (empty completion queue)
+	 * Strategy: Set kernel indices to match checkpointed values in EMPTY state:
+	 * - SQ: head = tail = checkpointed tail (queue empty, at libuv's position)
+	 * - CQ: head = tail = checkpointed head (queue empty, at libuv's position)
 	 *
-	 * This ensures libuv's cached pointers remain valid while the kernel
-	 * sees empty rings (no stale operations to process).
+	 * This keeps the rings empty (no stale data) while matching libuv's expectations.
 	 */
 	if (ring->sq_ring_addr) {
-		volatile uint32_t *sq_head_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.head);
-		volatile uint32_t *sq_tail_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.tail);
-		volatile uint32_t *cq_head_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.cq_off.head);
-		volatile uint32_t *cq_tail_ptr = (uint32_t *)((char *)ring->sq_ring_addr + params.cq_off.tail);
+		/* Ring indices are at kernel-provided offsets */
+		volatile uint32_t *sq_head = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.head);
+		volatile uint32_t *sq_tail = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.tail);
+		volatile uint32_t *cq_head = (uint32_t *)((char *)ring->sq_ring_addr + params.cq_off.head);
+		volatile uint32_t *cq_tail = (uint32_t *)((char *)ring->sq_ring_addr + params.cq_off.tail);
 
-		pr_info("  Ring state: checkpointed SQ head=%u tail=%u, CQ head=%u tail=%u\n",
+		pr_info("  Ring index sync: checkpointed sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u\n",
 			ring->sq_head, ring->sq_tail, ring->cq_head, ring->cq_tail);
-		pr_info("  Kernel initialized: SQ head=%u tail=%u, CQ head=%u tail=%u\n",
-			*sq_head_ptr, *sq_tail_ptr, *cq_head_ptr, *cq_tail_ptr);
-		/*
-		 * CRITICAL FIX: Synchronize kernel indices with libuv's cached state!
-		 *
-		 * The problem: libuv caches ring indices in its heap memory. After restore,
-		 * libuv expects indices at their checkpointed values, but kernel ring is at 0.
-		 * When libuv tries to submit/poll based on its cached values, it fails.
-		 *
-		 * Solution: Set kernel indices to match checkpointed values, but EMPTY:
-		 * - SQ: Set head = tail = checkpointed tail (empty, at libuv's position)
-		 * - CQ: Set head = tail = checkpointed head (empty, at libuv's position)
-		 */
-		*sq_head_ptr = ring->sq_tail;  /* Advance head to match tail -> SQ empty */
-		*sq_tail_ptr = ring->sq_tail;  /* Keep tail where libuv expects */
-		*cq_head_ptr = ring->cq_head;  /* Keep head where libuv expects */
-		*cq_tail_ptr = ring->cq_head;  /* Set tail to match head -> CQ empty */
+		pr_info("  Kernel initialized: sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u\n",
+			*sq_head, *sq_tail, *cq_head, *cq_tail);
 
-		pr_info("  Synchronized to: SQ head=%u tail=%u, CQ head=%u tail=%u\n",
-			*sq_head_ptr, *sq_tail_ptr, *cq_head_ptr, *cq_tail_ptr);
-		pr_info("  Rings EMPTY but indices match libuv's cached state\n");
+		/*
+		 * Set indices to make rings empty at the checkpointed position:
+		 * - SQ empty: sq_head = sq_tail = checkpointed sq_tail
+		 * - CQ empty: cq_head = cq_tail = checkpointed cq_head
+		 */
+		*sq_head = ring->sq_tail;
+		*sq_tail = ring->sq_tail;
+		*cq_head = ring->cq_head;
+		*cq_tail = ring->cq_head;
+
+		pr_info("  Synchronized: sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u (rings empty)\n",
+			*sq_head, *sq_tail, *cq_head, *cq_tail);
 	}
 
 	/* If the fd doesn't match, dup2 it to the expected fd */
@@ -1584,57 +1385,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		pr_info("  Moved fd from %d to %u\n", fd, ring->fd);
 	}
 
-	pr_info("Restored io_uring ring at fd=%u (ring state reset to empty)\n", ring->fd);
-
-	/*
-	 * Replay deferred epoll registrations.
-	 * These were collected during eventpoll restore when io_uring
-	 * didn't exist yet. Now we can add the io_uring fd to epoll.
-	 */
-	if (ring->n_epoll_refs > 0) {
-		unsigned int i;
-		pr_info("  Replaying %u deferred epoll registration(s)\n", ring->n_epoll_refs);
-
-		for (i = 0; i < ring->n_epoll_refs; i++) {
-			struct {
-				uint32_t events;
-				uint64_t data;
-			} __attribute__((packed)) event;
-
-			event.events = ring->epoll_refs[i].events;
-			event.data = ring->epoll_refs[i].data;
-
-			/*
-			 * Direct syscall to epoll_ctl since it's not in compel wrappers.
-			 * __NR_epoll_ctl = 233 on x86_64
-			 */
-			{
-				register long _ret asm("rax");
-				register long _nr  asm("rax") = 233; /* __NR_epoll_ctl */
-				register long _a1  asm("rdi") = ring->epoll_refs[i].epoll_fd;
-				register long _a2  asm("rsi") = 1;   /* EPOLL_CTL_ADD */
-				register long _a3  asm("rdx") = ring->fd;
-				register long _a4  asm("r10") = (long)&event;
-
-				asm volatile("syscall"
-					     : "=a"(_ret)
-					     : "0"(_nr), "r"(_a1), "r"(_a2), "r"(_a3), "r"(_a4)
-					     : "memory", "rcx", "r11");
-				ret = _ret;
-			}
-
-			if (ret < 0) {
-				pr_err("  epoll_ctl(epoll=%u, io_uring=%u) failed: %ld\n",
-				       ring->epoll_refs[i].epoll_fd, ring->fd, ret);
-				/* Continue with other registrations */
-			} else {
-				pr_info("  Added io_uring fd %u to epoll %u (events=0x%x)\n",
-					ring->fd, ring->epoll_refs[i].epoll_fd,
-					ring->epoll_refs[i].events);
-			}
-		}
-	}
-
+	pr_info("Restored io_uring ring at fd=%u\n", ring->fd);
 	return 0;
 }
 
@@ -2577,7 +2328,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * Restore io_uring rings
 	 */
-	pr_info("io_uring: About to restore %u io_uring ring(s)\n", args->io_uring_rings_n);
 	for (i = 0; i < args->io_uring_rings_n; i++)
 		if (restore_io_uring_ring(&args->io_uring_rings[i]) < 0)
 			goto core_restore_end;
@@ -2922,43 +2672,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	restore_posix_timers(args);
 
 	sys_munmap(args->rst_mem, args->rst_mem_size);
-
-	/*
-	 * Post-restore stabilization delay.
-	 *
-	 * After CRIU restore, thread scheduling order changes and libraries
-	 * like libuv (used by uvloop/vLLM) may have internal state that is
-	 * sensitive to timing. A brief delay allows the scheduler to settle
-	 * and helps avoid race conditions in userspace event loops.
-	 *
-	 * This is a workaround for a race condition where libuv's io_uring
-	 * backend aborts due to internal state inconsistency after restore.
-	 */
-	{
-		struct timespec delay = { .tv_sec = 0, .tv_nsec = 200000000 }; /* 200ms */
-		register long _ret asm("rax");
-		register long _nr  asm("rax") = 35; /* __NR_nanosleep */
-		register long _a1  asm("rdi") = (long)&delay;
-		register long _a2  asm("rsi") = 0;  /* NULL rem */
-
-		asm volatile("syscall"
-			     : "=a"(_ret)
-			     : "0"(_nr), "r"(_a1), "r"(_a2)
-			     : "memory", "rcx", "r11");
-
-		pr_info("Post-restore stabilization delay completed (200ms)\n");
-
-		/* Also yield to let other threads run */
-		_nr = 24; /* __NR_sched_yield */
-		asm volatile("syscall"
-			     : "=a"(_ret)
-			     : "0"(_nr)
-			     : "memory", "rcx", "r11");
-		asm volatile("syscall"
-			     : "=a"(_ret)
-			     : "0"(_nr)
-			     : "memory", "rcx", "r11");
-	}
 
 	/*
 	 * Sigframe stack.
