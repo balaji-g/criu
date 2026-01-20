@@ -1133,6 +1133,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	void *sq_ring_ptr, *sqe_ptr, *cq_ring_ptr;
 	unsigned long sq_ring_size, cq_ring_size, sqe_size;
 	int single_mmap;
+	int sqpoll_was_stripped = 0;
 
 	pr_info("Restoring io_uring ring: fd=%u sq=%u cq=%u sq_addr=0x%lx sq_size=%lu sqe_addr=0x%lx sqe_size=%lu\n",
 		ring->fd, ring->sq_entries, ring->cq_entries,
@@ -1161,7 +1162,6 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	 * See the code after ring index synchronization below.
 	 */
 #define IORING_SETUP_SQPOLL (1U << 1)
-	int sqpoll_was_stripped = 0;
 	if (params.flags & IORING_SETUP_SQPOLL) {
 		pr_warn("  STRIPPING SQPOLL flag for checkpoint/restore compatibility!\n");
 		pr_warn("  Original flags: 0x%x -> New flags: 0x%x\n",
@@ -1360,14 +1360,22 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		 * mapping, so cq_off is relative to sq_ring_addr. Without single_mmap,
 		 * CQ has its own mapping at cq_ring_addr, and cq_off is relative to that.
 		 */
-		unsigned long cq_base_addr = single_mmap ? ring->sq_ring_addr : ring->cq_ring_addr;
+		unsigned long cq_base_addr;
+		volatile uint32_t *sq_head;
+		volatile uint32_t *sq_tail;
+		volatile uint32_t *cq_head;
+		volatile uint32_t *cq_tail;
+		volatile uint32_t *sqflags;
+		uint32_t old_flags;
+
+		cq_base_addr = single_mmap ? ring->sq_ring_addr : ring->cq_ring_addr;
 		if (!cq_base_addr)
 			cq_base_addr = ring->sq_ring_addr;  /* Fallback for safety */
 
-		volatile uint32_t *sq_head = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.head);
-		volatile uint32_t *sq_tail = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.tail);
-		volatile uint32_t *cq_head = (uint32_t *)((char *)cq_base_addr + params.cq_off.head);
-		volatile uint32_t *cq_tail = (uint32_t *)((char *)cq_base_addr + params.cq_off.tail);
+		sq_head = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.head);
+		sq_tail = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.tail);
+		cq_head = (uint32_t *)((char *)cq_base_addr + params.cq_off.head);
+		cq_tail = (uint32_t *)((char *)cq_base_addr + params.cq_off.tail);
 
 		pr_info("  Ring index sync: checkpointed sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u\n",
 			ring->sq_head, ring->sq_tail, ring->cq_head, ring->cq_tail);
@@ -1406,8 +1414,8 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		 */
 #define IORING_SQ_NEED_WAKEUP (1U << 0)
 		if (sqpoll_was_stripped) {
-			volatile uint32_t *sqflags = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.flags);
-			uint32_t old_flags = *sqflags;
+			sqflags = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.flags);
+			old_flags = *sqflags;
 			*sqflags |= IORING_SQ_NEED_WAKEUP;
 			pr_info("  SQPOLL compensation: set NEED_WAKEUP in sqflags (0x%x -> 0x%x)\n",
 				old_flags, *sqflags);
