@@ -1353,11 +1353,21 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	 * This keeps the rings empty (no stale data) while matching libuv's expectations.
 	 */
 	if (ring->sq_ring_addr) {
-		/* Ring indices are at kernel-provided offsets */
+		/*
+		 * Ring indices are at kernel-provided offsets.
+		 * 
+		 * IMPORTANT: With IORING_FEAT_SINGLE_MMAP, SQ and CQ share the same
+		 * mapping, so cq_off is relative to sq_ring_addr. Without single_mmap,
+		 * CQ has its own mapping at cq_ring_addr, and cq_off is relative to that.
+		 */
+		unsigned long cq_base_addr = single_mmap ? ring->sq_ring_addr : ring->cq_ring_addr;
+		if (!cq_base_addr)
+			cq_base_addr = ring->sq_ring_addr;  /* Fallback for safety */
+
 		volatile uint32_t *sq_head = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.head);
 		volatile uint32_t *sq_tail = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.tail);
-		volatile uint32_t *cq_head = (uint32_t *)((char *)ring->sq_ring_addr + params.cq_off.head);
-		volatile uint32_t *cq_tail = (uint32_t *)((char *)ring->sq_ring_addr + params.cq_off.tail);
+		volatile uint32_t *cq_head = (uint32_t *)((char *)cq_base_addr + params.cq_off.head);
+		volatile uint32_t *cq_tail = (uint32_t *)((char *)cq_base_addr + params.cq_off.tail);
 
 		pr_info("  Ring index sync: checkpointed sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u\n",
 			ring->sq_head, ring->sq_tail, ring->cq_head, ring->cq_tail);
