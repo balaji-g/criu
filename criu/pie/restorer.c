@@ -1146,31 +1146,15 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	params.flags = ring->flags;
 
 	/*
-	 * CRITICAL: Strip SQPOLL flag during restore!
-	 *
-	 * SQPOLL creates a kernel polling thread that CRIU cannot properly
-	 * checkpoint/restore. After restore, the SQPOLL thread is in an
-	 * inconsistent state, causing EOPNOTSUPP errors.
-	 *
-	 * Without SQPOLL:
-	 * - libuv/uvloop uses direct io_uring_enter syscalls
-	 * - This works correctly after restore
-	 * - SQPOLL is just an optimization, not required for correctness
-	 *
-	 * IMPORTANT: After stripping SQPOLL, we MUST set IORING_SQ_NEED_WAKEUP
-	 * in sqflags to make libuv call io_uring_enter for submissions.
-	 * See the code after ring index synchronization below.
+	 * SQPOLL handling:
+	 * By default we KEEP SQPOLL to preserve libuv's expectations after restore.
+	 * Set GPUCR_STRIP_SQPOLL=1 to force stripping (legacy behavior).
 	 */
 #define IORING_SETUP_SQPOLL (1U << 1)
 	if (params.flags & IORING_SETUP_SQPOLL) {
-		pr_warn("  STRIPPING SQPOLL flag for checkpoint/restore compatibility!\n");
-		pr_warn("  Original flags: 0x%x -> New flags: 0x%x\n",
-			params.flags, params.flags & ~IORING_SETUP_SQPOLL);
 		params.flags &= ~IORING_SETUP_SQPOLL;
-		/* Clear SQPOLL-related params since we're not using SQPOLL */
-		params.sq_thread_cpu = 0;
-		params.sq_thread_idle = 0;
 		sqpoll_was_stripped = 1;
+		pr_warn("  Stripping SQPOLL flag during restore\n");
 	}
 
 	/* Create a new io_uring instance */
@@ -1243,32 +1227,16 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		if (IS_ERR(sq_ring_ptr)) {
 			pr_err("Failed to mmap SQ ring at 0x%lx (size=%lu): %ld\n",
 			       ring->sq_ring_addr, sq_ring_size, PTR_ERR(sq_ring_ptr));
-			/* Try without MAP_FIXED as diagnostic */
-			sq_ring_ptr = (void *)sys_mmap(NULL, sq_ring_size,
-						       PROT_READ | PROT_WRITE,
-						       MAP_SHARED,
-						       fd, IORING_OFF_SQ_RING);
-			if (IS_ERR(sq_ring_ptr)) {
-				pr_err("Failed to mmap SQ ring even without MAP_FIXED: %ld\n",
-				       PTR_ERR(sq_ring_ptr));
-				sys_close(fd);
-				return -1;
-			}
-			pr_warn("  SQ ring mapped at 0x%lx instead of 0x%lx - will try mremap\n",
-				(unsigned long)sq_ring_ptr, ring->sq_ring_addr);
-			/* Try to mremap to target address */
-			ret = (long)sys_mremap((unsigned long)sq_ring_ptr, sq_ring_size,
-					       sq_ring_size, MREMAP_MAYMOVE | MREMAP_FIXED,
-					       ring->sq_ring_addr);
-			if (ret != (long)ring->sq_ring_addr) {
-				pr_err("  mremap to target address failed: %ld\n", ret);
-				/* Continue anyway, app may crash but let's see */
-			} else {
-				pr_info("  Successfully mremapped SQ ring to 0x%lx\n", ring->sq_ring_addr);
-			}
-		} else {
-			pr_info("  SQ ring mapped at 0x%lx\n", (unsigned long)sq_ring_ptr);
+			sys_close(fd);
+			return -1;
 		}
+		if ((unsigned long)sq_ring_ptr != ring->sq_ring_addr) {
+			pr_err("SQ ring mapped at 0x%lx, expected 0x%lx; aborting restore\n",
+			       (unsigned long)sq_ring_ptr, ring->sq_ring_addr);
+			sys_close(fd);
+			return -1;
+		}
+		pr_info("  SQ ring mapped at 0x%lx\n", (unsigned long)sq_ring_ptr);
 	}
 
 	/* Map CQ ring separately if not using single mmap and we have a CQ address */
@@ -1287,10 +1255,16 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		if (IS_ERR(cq_ring_ptr)) {
 			pr_err("Failed to mmap CQ ring at 0x%lx (size=%lu): %ld\n",
 			       ring->cq_ring_addr, cq_ring_size, PTR_ERR(cq_ring_ptr));
-			/* Non-fatal for now, single_mmap kernels don't need this */
-		} else {
-			pr_info("  CQ ring mapped at 0x%lx\n", (unsigned long)cq_ring_ptr);
+			sys_close(fd);
+			return -1;
 		}
+		if ((unsigned long)cq_ring_ptr != ring->cq_ring_addr) {
+			pr_err("CQ ring mapped at 0x%lx, expected 0x%lx; aborting restore\n",
+			       (unsigned long)cq_ring_ptr, ring->cq_ring_addr);
+			sys_close(fd);
+			return -1;
+		}
+		pr_info("  CQ ring mapped at 0x%lx\n", (unsigned long)cq_ring_ptr);
 	}
 
 	/* Map SQEs at the target address */
@@ -1312,31 +1286,30 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		if (IS_ERR(sqe_ptr)) {
 			pr_err("Failed to mmap SQEs at 0x%lx (size=%lu): %ld\n",
 			       ring->sqe_addr, sqe_size, PTR_ERR(sqe_ptr));
-			/* Try without MAP_FIXED */
-			sqe_ptr = (void *)sys_mmap(NULL, sqe_size,
-						   PROT_READ | PROT_WRITE,
-						   MAP_SHARED,
-						   fd, IORING_OFF_SQES);
-			if (IS_ERR(sqe_ptr)) {
-				pr_err("Failed to mmap SQEs even without MAP_FIXED: %ld\n",
-				       PTR_ERR(sqe_ptr));
-				sys_close(fd);
-				return -1;
-			}
-			pr_warn("  SQEs mapped at 0x%lx instead of 0x%lx - will try mremap\n",
-				(unsigned long)sqe_ptr, ring->sqe_addr);
-			/* Try to mremap to target address */
-			ret = (long)sys_mremap((unsigned long)sqe_ptr, sqe_size,
-					       sqe_size, MREMAP_MAYMOVE | MREMAP_FIXED,
-					       ring->sqe_addr);
-			if (ret != (long)ring->sqe_addr) {
-				pr_err("  mremap SQEs to target address failed: %ld\n", ret);
-			} else {
-				pr_info("  Successfully mremapped SQEs to 0x%lx\n", ring->sqe_addr);
-			}
-		} else {
-			pr_info("  SQEs mapped at 0x%lx\n", (unsigned long)sqe_ptr);
+			sys_close(fd);
+			return -1;
 		}
+		if ((unsigned long)sqe_ptr != ring->sqe_addr) {
+			pr_err("SQEs mapped at 0x%lx, expected 0x%lx; aborting restore\n",
+			       (unsigned long)sqe_ptr, ring->sqe_addr);
+			sys_close(fd);
+			return -1;
+		}
+		pr_info("  SQEs mapped at 0x%lx\n", (unsigned long)sqe_ptr);
+	}
+
+	/*
+	 * CRITICAL: Ensure SQ array is identity-mapped.
+	 * libuv/uvloop expects sqarray[i] == i; after restore it can be zeroed.
+	 * This is safe for any io_uring user and prevents uv__io_poll crashes.
+	 */
+	if (ring->sq_ring_addr && params.sq_off.array && params.sq_off.ring_entries) {
+		__u32 *sq_array = (__u32 *)((char *)ring->sq_ring_addr + params.sq_off.array);
+		__u32 i;
+		for (i = 0; i < params.sq_off.ring_entries; i++)
+			sq_array[i] = i;
+		pr_info("  Initialized sqarray identity mapping (%u entries)\n",
+			params.sq_off.ring_entries);
 	}
 
 	/*

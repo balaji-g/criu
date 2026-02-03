@@ -467,8 +467,33 @@ static int eventpoll_retore_tfd(int fd, int id, EventpollTfdEntry *tdefe)
 
 	event.events = tdefe->events;
 	event.data.u64 = tdefe->data;
+	/*
+	 * libuv stores epoll data as fd (not pointer). If we see a pointer-like
+	 * value paired with a small tfd, prefer the fd to avoid bogus watcher
+	 * indices after restore.
+	 */
+	if (tdefe->tfd < 1024 &&
+	    tdefe->data != (uint64_t)tdefe->tfd &&
+	    tdefe->data >= 0x00007f0000000000ULL &&
+	    tdefe->data <= 0x00007fffffffffffULL) {
+		pr_warn("epoll: tfd %d has pointer-like data 0x%llx, using fd value\n",
+			tdefe->tfd, (unsigned long long)tdefe->data);
+		event.data.u64 = (uint64_t)tdefe->tfd;
+	}
 	if (epoll_ctl(fd, EPOLL_CTL_ADD, tdefe->tfd, &event)) {
 		int err = errno;
+		if (err == EBADF) {
+			/*
+			 * EBADF can mean either epoll fd or tfd is invalid.
+			 * If the target fd is missing, skip this entry so
+			 * restore can continue.
+			 */
+			if (fcntl(tdefe->tfd, F_GETFD) < 0 && errno == EBADF) {
+				pr_warn("epoll: Skipping tfd %d - fd missing in restored task\n",
+					tdefe->tfd);
+				return 0;
+			}
+		}
 		/*
 		 * epoll_ctl can fail for several reasons:
 		 * - EBADF: target fd doesn't exist (socket was skipped)

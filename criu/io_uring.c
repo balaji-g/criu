@@ -24,6 +24,8 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/utsname.h>
 
 #include "vma.h"
 #include "xmalloc.h"
@@ -48,6 +50,54 @@
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "io_uring: "
+
+/*
+ * Structure to track io_uring fd info for size-based VMA matching.
+ * 
+ * PROBLEM: Linux uses a shared anon_inode for all io_urings in a process,
+ * so we can't use inode to determine which VMA belongs to which fd.
+ * 
+ * SOLUTION: Match VMAs to fds by size. Each io_uring has:
+ *   - SQE array: size = sq_entries * 64 (sizeof(io_uring_sqe))
+ *   - Ring buffer: size varies but is unique per configuration
+ */
+struct io_uring_fd_info {
+	int fd;
+	uint32_t sq_entries;
+	uint32_t cq_entries;
+	uint32_t flags;
+	size_t expected_sqe_size;  /* sq_entries * 64 */
+	size_t expected_ring_size; /* kernel-computed SQ ring mapping size */
+	unsigned long ino;
+	int sqe_vma_matched;       /* 1 if SQE VMA assigned */
+	int ring_vma_matched;      /* 1 if ring VMA assigned */
+	int sqe_vma_idx;           /* index of matched SQE VMA, -1 if none */
+	int32_t sq_thread;
+	int32_t sq_thread_cpu;
+	IoUringEntry *entry;       /* Associated protobuf entry */
+};
+
+#define MAX_IO_URINGS 16  /* Max io_urings per process we support */
+
+struct io_uring_ring_vma_info {
+	unsigned long addr;
+	size_t size;
+	uint32_t ring_entries;
+	int matched_sqe;
+	int assigned_fd;
+	int sqe_idx;
+	uint32_t sqe_size;
+};
+
+struct io_uring_sqe_vma_info {
+	unsigned long addr;
+	size_t size;
+	uint32_t entries_64;
+	uint32_t entries_128;
+	int matched;
+};
+
+#define IORING_SQ_RING_MASK_OFFSET 8
 
 /* io_uring syscall number if not defined */
 #ifndef __NR_io_uring_setup
@@ -106,6 +156,12 @@ struct io_uring_params {
 #ifndef IORING_SETUP_CQE32
 #define IORING_SETUP_CQE32	(1U << 11)  /* 32-byte CQEs - bit 11, NOT bit 9 */
 #endif
+#ifndef IORING_SETUP_SQPOLL
+#define IORING_SETUP_SQPOLL	(1U << 1)
+#endif
+#ifndef IORING_FEAT_SINGLE_MMAP
+#define IORING_FEAT_SINGLE_MMAP	(1U << 0)
+#endif
 
 /* Element sizes */
 #define SIZEOF_SQE_NORMAL	64
@@ -113,9 +169,96 @@ struct io_uring_params {
 #define SIZEOF_CQE_NORMAL	16
 #define SIZEOF_CQE_32		32
 
+enum io_uring_vma_strategy {
+	IOURING_VMA_STRAT_RING_MASK = 0,
+	IOURING_VMA_STRAT_KERNEL_SIZES = 1,
+};
+
+static int parse_kernel_release(int *major, int *minor, int *patch)
+{
+	struct utsname uts;
+	int a = 0, b = 0, c = 0;
+
+	if (uname(&uts) < 0) {
+		pr_perror("Failed to read kernel release");
+		return -1;
+	}
+
+	if (sscanf(uts.release, "%d.%d.%d", &a, &b, &c) < 2) {
+		pr_warn("Unable to parse kernel release: %s\n", uts.release);
+		return -1;
+	}
+
+	*major = a;
+	*minor = b;
+	*patch = c;
+	return 0;
+}
+
+static enum io_uring_vma_strategy select_io_uring_vma_strategy(void)
+{
+	int major = 0, minor = 0, patch = 0;
+
+	if (parse_kernel_release(&major, &minor, &patch) < 0) {
+		pr_warn("io_uring: using ring-mask VMA matching (kernel unknown)\n");
+		return IOURING_VMA_STRAT_RING_MASK;
+	}
+
+	if (major > 5 || (major == 5 && minor >= 15)) {
+		pr_info("io_uring: kernel %d.%d.%d -> use kernel-size VMA matching\n",
+			major, minor, patch);
+		return IOURING_VMA_STRAT_KERNEL_SIZES;
+	}
+
+	pr_info("io_uring: kernel %d.%d.%d -> use ring-mask VMA matching\n",
+		major, minor, patch);
+	return IOURING_VMA_STRAT_RING_MASK;
+}
+
 static inline uint32_t get_sqe_size_for_flags(uint32_t flags)
 {
 	return (flags & IORING_SETUP_SQE128) ? SIZEOF_SQE_128 : SIZEOF_SQE_NORMAL;
+}
+
+static inline uint32_t get_cqe_size_for_flags(uint32_t flags)
+{
+	return (flags & IORING_SETUP_CQE32) ? SIZEOF_CQE_32 : SIZEOF_CQE_NORMAL;
+}
+
+static int calc_kernel_ring_sizes(uint32_t sq_entries, uint32_t cq_entries, uint32_t flags,
+				  size_t *sq_ring_size, size_t *cq_ring_size, size_t *sqe_size,
+				  uint32_t *features)
+{
+	struct io_uring_params params = { 0 };
+	int fd;
+	uint32_t cqe_size;
+	uint32_t ring_flags = flags & ~IORING_SETUP_SQPOLL;
+
+	if (!sq_entries)
+		return -1;
+
+	params.sq_entries = sq_entries;
+	params.cq_entries = cq_entries;
+	params.flags = ring_flags;
+
+	fd = syscall(__NR_io_uring_setup, params.sq_entries, &params);
+	if (fd < 0)
+		return -1;
+	close(fd);
+
+	cqe_size = get_cqe_size_for_flags(flags);
+	*sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(__u32);
+	*cq_ring_size = params.cq_off.cqes + params.cq_entries * cqe_size;
+	*sqe_size = params.sq_entries * get_sqe_size_for_flags(flags);
+
+	*sq_ring_size = (*sq_ring_size + 4095) & ~4095UL;
+	*cq_ring_size = (*cq_ring_size + 4095) & ~4095UL;
+	*sqe_size = (*sqe_size + 4095) & ~4095UL;
+
+	if (features)
+		*features = params.features;
+
+	return 0;
 }
 
 struct io_uring_fdinfo {
@@ -134,7 +277,59 @@ struct io_uring_fdinfo {
 	uint32_t user_files;
 	uint32_t user_bufs;
 	uint32_t flags;		/* io_uring setup flags from kernel fdinfo */
+	uint32_t sq_entries;	/* SQ ring size from SqSize field */
+	uint32_t cq_entries;	/* CQ ring size from CqSize field */
 };
+
+struct io_uring_map_entry {
+	int fd;
+	uint32_t sq_entries;
+	uint32_t cq_entries;
+	uint32_t flags;
+};
+
+static int load_iouring_map(pid_t pid, struct io_uring_map_entry *map, int max_entries)
+{
+	char path[PATH_MAX];
+	FILE *f;
+	int count = 0;
+
+	snprintf(path, sizeof(path), "/proc/%d/root/gpucr-lib/.io_uring_map", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return 0;
+
+	while (count < max_entries) {
+		int fd = 0;
+		unsigned int sq = 0, cq = 0, flags = 0;
+		int rc = fscanf(f, "%d %u %u %x", &fd, &sq, &cq, &flags);
+		if (rc != 4)
+			break;
+		map[count].fd = fd;
+		map[count].sq_entries = sq;
+		map[count].cq_entries = cq;
+		map[count].flags = flags;
+		count++;
+	}
+	fclose(f);
+
+	if (count > 0)
+		pr_info("Loaded io_uring map entries: %d\n", count);
+
+	return count;
+}
+
+static const struct io_uring_map_entry *
+find_iouring_map_entry(const struct io_uring_map_entry *map, int count, int fd)
+{
+	int i;
+
+	for (i = 0; i < count; i++) {
+		if (map[i].fd == fd)
+			return &map[i];
+	}
+	return NULL;
+}
 
 /*
  * Deferred epoll registrations for io_uring.
@@ -211,6 +406,10 @@ static int parse_io_uring_fdinfo(int proc_fd, int fd, struct io_uring_fdinfo *in
 	FILE *f;
 	int fdinfo_fd;
 
+	/* Initialize struct to 0 so optional fields have default values */
+	memset(info, 0, sizeof(*info));
+	info->sq_thread = -1;  /* -1 means no SQPOLL thread */
+
 	snprintf(path, sizeof(path), "fdinfo/%d", fd);
 	fdinfo_fd = openat(proc_fd, path, O_RDONLY);
 	if (fdinfo_fd < 0) {
@@ -252,12 +451,16 @@ static int parse_io_uring_fdinfo(int proc_fd, int fd, struct io_uring_fdinfo *in
 		else if (!strcmp(buf, "UserFiles")) info->user_files = strtoul(value, NULL, 0);
 		else if (!strcmp(buf, "UserBufs")) info->user_bufs = strtoul(value, NULL, 0);
 		else if (!strcmp(buf, "Flags")) info->flags = strtoul(value, NULL, 0);
+		else if (!strcmp(buf, "SqSize")) info->sq_entries = strtoul(value, NULL, 0);
+		else if (!strcmp(buf, "CqSize")) info->cq_entries = strtoul(value, NULL, 0);
 	}
 
 	fclose(f);
 	return 0;
 }
 
+/* OLD CODE: These functions were used in inode-based matching, now replaced by size-based matching */
+#if 0
 static int find_io_uring_fd(pid_t pid, unsigned long ino, int *found_fd)
 {
 	char fd_dir[64];
@@ -308,10 +511,9 @@ static int find_io_uring_fd(pid_t pid, unsigned long ino, int *found_fd)
 	}
 	return 0;
 }
+#endif
 
-/*
- * Helper to count VMAs for a specific io_uring inode
- */
+#if 0  /* OLD CODE: Used in inode-based matching */
 static int count_vmas_for_ino(struct vm_area_list *vmas, unsigned long ino)
 {
 	struct vma_area *vma;
@@ -326,9 +528,6 @@ static int count_vmas_for_ino(struct vm_area_list *vmas, unsigned long ino)
 	return count;
 }
 
-/*
- * Helper to add a VMA to the entry's vmas array
- */
 static int add_vma_to_entry(IoUringEntry *entry, struct vma_area *vma, int *vma_idx)
 {
 	IoUringVma *v;
@@ -361,20 +560,200 @@ static int add_vma_to_entry(IoUringEntry *entry, struct vma_area *vma, int *vma_
 
 	return 0;
 }
+#endif
 
 /*
- * Find existing entry by inode, or return NULL if not found.
- * This replaces the old last_ino assumption with a proper lookup.
+ * Pre-scan all io_uring fds in a process to collect size info.
+ * This enables size-based VMA matching when inodes are shared.
+ * Returns number of io_urings found, or -1 on error.
  */
+static int prescan_io_uring_fds(pid_t pid, int proc_fd,
+				struct io_uring_fd_info *fd_info, int max_fds,
+				const struct io_uring_map_entry *map, int map_count)
+{
+	char fd_dir[64];
+	DIR *dir;
+	struct dirent *de;
+	int count = 0;
+
+	snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+	dir = opendir(fd_dir);
+	if (!dir) {
+		pr_perror("Can't open %s", fd_dir);
+		return -1;
+	}
+
+	while ((de = readdir(dir)) != NULL && count < max_fds) {
+		char link[256], path[64];
+		struct stat st;
+		struct io_uring_fdinfo fdinfo;
+		int fd_num;
+
+		if (de->d_name[0] == '.') continue;
+		fd_num = atoi(de->d_name);
+		snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd_num);
+
+		/* Check if it's an io_uring */
+		{
+			ssize_t len = readlink(path, link, sizeof(link) - 1);
+			if (len < 0)
+				continue;
+			link[len] = '\0';
+		}
+		if (!strstr(link, "io_uring")) continue;
+
+		/* Get inode */
+		if (fstatat(dirfd(dir), de->d_name, &st, 0) < 0) continue;
+
+		/* Parse fdinfo to get sq_entries */
+		if (parse_io_uring_fdinfo(proc_fd, fd_num, &fdinfo) < 0) {
+			pr_warn("Can't parse fdinfo for io_uring fd %d\n", fd_num);
+			continue;
+		}
+
+		if (map_count > 0) {
+			const struct io_uring_map_entry *m =
+				find_iouring_map_entry(map, map_count, fd_num);
+			if (!m) {
+				pr_warn("Pre-scan: fd=%d io_uring not in map, skipping\n", fd_num);
+				continue;
+			}
+			fd_info[count].sq_entries = m->sq_entries;
+			fd_info[count].cq_entries = m->cq_entries;
+			fd_info[count].flags = m->flags;
+			pr_info("Pre-scan: fd=%d using map sq=%u cq=%u flags=0x%x\n",
+				fd_num, m->sq_entries, m->cq_entries, m->flags);
+		}
+
+		/* Store fd info */
+		fd_info[count].fd = fd_num;
+		/* fdinfo may not expose SqSize/CqSize on some kernels */
+		if (fd_info[count].sq_entries > 0) {
+			/* Keep map-derived values */
+		} else if (fdinfo.sq_entries > 0)
+			fd_info[count].sq_entries = fdinfo.sq_entries;
+		else if (fdinfo.sq_mask > 0)
+			fd_info[count].sq_entries = fdinfo.sq_mask + 1;
+		else
+			fd_info[count].sq_entries = 0;
+
+		if (fd_info[count].cq_entries > 0) {
+			/* Keep map-derived values */
+		} else if (fdinfo.cq_entries > 0)
+			fd_info[count].cq_entries = fdinfo.cq_entries;
+		else if (fdinfo.cq_mask > 0)
+			fd_info[count].cq_entries = fdinfo.cq_mask + 1;
+		else
+			fd_info[count].cq_entries = 0;
+
+		if (fd_info[count].flags == 0)
+			fd_info[count].flags = fdinfo.flags;
+		fd_info[count].expected_sqe_size = 0;
+		fd_info[count].expected_ring_size = 0;
+		fd_info[count].ino = st.st_ino;
+		fd_info[count].sqe_vma_matched = 0;
+		fd_info[count].ring_vma_matched = 0;
+		fd_info[count].sqe_vma_idx = -1;
+		fd_info[count].sq_thread = fdinfo.sq_thread;
+		fd_info[count].sq_thread_cpu = fdinfo.sq_thread_cpu;
+		fd_info[count].entry = NULL;
+
+		pr_info("Pre-scan: fd=%d sq_entries=%u ino=%lu sq_thread=%d\n",
+			fd_num, fd_info[count].sq_entries,
+			fd_info[count].ino, fd_info[count].sq_thread);
+
+		count++;
+	}
+
+	closedir(dir);
+	pr_info("Pre-scan found %d io_uring fd(s)\n", count);
+	return count;
+}
+
+static int read_u32_from_process(pid_t pid, int mem_fd, unsigned long addr, uint32_t *value)
+{
+	struct iovec local;
+	struct iovec remote;
+	ssize_t bytes;
+
+	local.iov_base = value;
+	local.iov_len = sizeof(*value);
+	remote.iov_base = (void *)addr;
+	remote.iov_len = sizeof(*value);
+
+	bytes = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+	if (bytes == sizeof(*value))
+		return 0;
+
+	if (mem_fd >= 0) {
+		bytes = pread(mem_fd, value, sizeof(*value), (off_t)addr);
+		if (bytes == sizeof(*value))
+			return 0;
+	}
+
+	pr_perror("process_vm_readv failed at 0x%lx (read %zd)", addr, bytes);
+
+	return -1;
+}
+
+static int read_ring_entries_from_vma(pid_t pid, int mem_fd, unsigned long vma_start,
+				      uint32_t *ring_entries)
+{
+	uint32_t ring_mask = 0;
+
+	if (read_u32_from_process(pid, mem_fd, vma_start + IORING_SQ_RING_MASK_OFFSET, &ring_mask) < 0)
+		return -1;
+
+	*ring_entries = ring_mask + 1;
+	return 0;
+}
+
+static int append_iouring_vma(IoUringEntry *entry, unsigned long addr, size_t size,
+			      unsigned long pgoff, int *idx)
+{
+	IoUringVma *v;
+
+	if (!entry->vmas || *idx >= (int)entry->n_vmas)
+		return -1;
+
+	v = xmalloc(sizeof(*v));
+	if (!v)
+		return -1;
+
+	io_uring_vma__init(v);
+	v->addr = addr;
+	v->size = size;
+	v->pgoff = pgoff;
+	entry->vmas[*idx] = v;
+	(*idx)++;
+
+	return 0;
+}
+
+#if 0  /* OLD CODE: Unused helper functions */
+static struct io_uring_fd_info *find_fd_info_by_fd(
+	struct io_uring_fd_info *fd_info, int num_fds, int fd)
+{
+	int i;
+	for (i = 0; i < num_fds; i++) {
+		if (fd_info[i].fd == fd)
+			return &fd_info[i];
+	}
+	return NULL;
+}
+
 static IoUringEntry *find_entry_by_ino(MmEntry *mme, int nr, unsigned long ino)
 {
 	int i;
+	if (!mme->io_urings || nr <= 0)
+		return NULL;
 	for (i = 0; i < nr; i++) {
 		if (mme->io_urings[i] && mme->io_urings[i]->ino == ino)
 			return mme->io_urings[i];
 	}
 	return NULL;
 }
+#endif
 
 int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 {
@@ -384,148 +763,95 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 	int nr = 0;
 	int ret = -1;
 	int proc_fd;
-	int vma_idx = 0;
+	int mem_fd = -1;
+	struct io_uring_fd_info fd_info[MAX_IO_URINGS];
+	struct io_uring_ring_vma_info ring_vmas[MAX_IO_URINGS];
+	struct io_uring_sqe_vma_info sqe_vmas[MAX_IO_URINGS];
+	struct io_uring_map_entry map_entries[MAX_IO_URINGS];
+	int map_count = 0;
+	int num_io_urings = 0;
+	int i;
+	int ring_vma_count = 0;
+	int sqe_vma_count = 0;
+	enum io_uring_vma_strategy vma_strategy;
 
-	if (!vmas->nr_iourings) {
-		pr_debug("No io_uring VMAs to dump\n");
-		return 0;
+	/*
+	 * Note: We no longer early-return if nr_iourings == 0.
+	 * Some io_urings may have no VMA mappings but still need to be dumped.
+	 * We scan /proc/pid/fd below to catch these.
+	 */
+	if (vmas->nr_iourings > 0) {
+		pr_info("Dumping %u io_uring VMA(s)\n", vmas->nr_iourings);
 	}
-
-	pr_info("Dumping %u io_uring VMA(s)\n", vmas->nr_iourings);
 
 	proc_fd = open_proc(pid, ".");
 	if (proc_fd < 0) return -1;
+	mem_fd = openat(proc_fd, "mem", O_RDONLY);
+	if (mem_fd < 0)
+		pr_warn("Failed to open /proc/%d/mem, falling back to process_vm_readv only\n", pid);
 
-	/* Allocate space for entries (one per unique inode, not per VMA) */
-	mme->io_urings = xmalloc(vmas->nr_iourings * sizeof(IoUringEntry *));
-	if (!mme->io_urings) {
+	vma_strategy = select_io_uring_vma_strategy();
+
+	/*
+	 * NEW: Pre-scan all io_uring fds to enable SIZE-BASED VMA matching.
+	 * This is needed because Linux uses a shared anon_inode for all io_urings,
+	 * so we can't use inode to determine which VMA belongs to which fd.
+	 */
+	map_count = load_iouring_map(pid, map_entries, MAX_IO_URINGS);
+	num_io_urings = prescan_io_uring_fds(pid, proc_fd, fd_info,
+					     MAX_IO_URINGS,
+					     map_entries, map_count);
+	if (num_io_urings < 0) {
+		pr_err("Failed to pre-scan io_uring fds\n");
 		close(proc_fd);
 		return -1;
 	}
-	/* Initialize to NULL for safe lookup */
-	memset(mme->io_urings, 0, vmas->nr_iourings * sizeof(IoUringEntry *));
 
-	/*
-	 * Process VMAs and collect ALL addresses per io_uring inode.
-	 * CRITICAL: uvloop creates MULTIPLE mmap()s on the same ring fd,
-	 * so we must capture and restore ALL of them.
-	 *
-	 * NOTE: We use find_entry_by_ino() to properly group VMAs by inode,
-	 * rather than assuming VMAs are sorted by inode (which isn't guaranteed).
-	 */
-	list_for_each_entry(vma, &vmas->h, list) {
-		int fd;
-
-		if (!vma_entry_is(vma->e, VMA_AREA_IOURING))
-			continue;
-
-		/* Check if this VMA belongs to an existing entry (by inode lookup) */
-		entry = find_entry_by_ino(mme, nr, vma->vm_iouring_ino);
-		if (entry != NULL) {
-			/* Find the vma_idx for this entry (we need to track per-entry) */
-			vma_idx = 0;
-			for (size_t k = 0; k < entry->n_vmas; k++) {
-				if (entry->vmas[k] != NULL)
-					vma_idx++;
-			}
-
-			/* Add VMA to existing entry's vmas array */
-			if (add_vma_to_entry(entry, vma, &vma_idx) < 0)
-				goto err;
-
-			/* Also update legacy single-address fields (keep last of each type) */
-			if (vma->e->pgoff == IORING_OFF_SQ_RING) {
-				entry->sq_ring_addr = vma->e->start;
-				entry->sq_ring_size = vma->e->end - vma->e->start;
-			} else if (vma->e->pgoff == IORING_OFF_CQ_RING) {
-				entry->cq_ring_addr = vma->e->start;
-				entry->cq_ring_size = vma->e->end - vma->e->start;
-			} else if (vma->e->pgoff == IORING_OFF_SQES) {
-				entry->sqe_addr = vma->e->start;
-				entry->sqe_size = vma->e->end - vma->e->start;
-			}
-			continue;
+	/* Allocate space for all io_uring entries */
+	if (num_io_urings > 0) {
+		mme->io_urings = xmalloc(num_io_urings * sizeof(IoUringEntry *));
+		if (!mme->io_urings) {
+			close(proc_fd);
+			return -1;
 		}
+		memset(mme->io_urings, 0, num_io_urings * sizeof(IoUringEntry *));
+	} else {
+		mme->io_urings = NULL;
+	}
 
-		/* New io_uring inode - create a new entry */
-		if (find_io_uring_fd(pid, vma->vm_iouring_ino, &fd) < 0) {
-			pr_err("Can't find fd for io_uring ino %lu\n", vma->vm_iouring_ino);
+	/* Create entries for all pre-scanned io_uring fds */
+	for (i = 0; i < num_io_urings; i++) {
+		if (parse_io_uring_fdinfo(proc_fd, fd_info[i].fd, &fdinfo) < 0) {
+			pr_err("Can't parse fdinfo for io_uring fd %d\n", fd_info[i].fd);
 			goto err;
 		}
 
-		if (parse_io_uring_fdinfo(proc_fd, fd, &fdinfo) < 0) {
-			pr_err("Can't parse fdinfo for io_uring fd %d\n", fd);
+		/* Quiescence check */
+		if (fdinfo.sq_head != fdinfo.sq_tail || fdinfo.cq_head != fdinfo.cq_tail) {
+			pr_err("io_uring fd %d has pending I/O - cannot checkpoint\n", fd_info[i].fd);
 			goto err;
-		}
-
-		/*
-		 * QUIESCENCE CHECK: Ensure io_uring ring is idle before checkpoint.
-		 *
-		 * We check TWO things:
-		 * 1. SQEs/CQEs count: These are registered files/buffers (less critical)
-		 * 2. head != tail: This means pending submissions or completions (CRITICAL)
-		 *
-		 * If sq_head != sq_tail: there are unprocessed submission entries
-		 * If cq_head != cq_tail: there are unprocessed completion entries
-		 *
-		 * We MUST fail if the ring is not quiescent - restoring with in-flight
-		 * I/O will cause corruption or hangs.
-		 */
-		if (fdinfo.sq_head != fdinfo.sq_tail) {
-			pr_err("io_uring fd %d has pending submissions: sq_head=%u sq_tail=%u\n",
-			       fd, fdinfo.sq_head, fdinfo.sq_tail);
-			pr_err("  Checkpoint while io_uring is busy is not supported.\n");
-			pr_err("  Ensure application drains io_uring before checkpoint.\n");
-			goto err;
-		}
-		if (fdinfo.cq_head != fdinfo.cq_tail) {
-			pr_err("io_uring fd %d has pending completions: cq_head=%u cq_tail=%u\n",
-			       fd, fdinfo.cq_head, fdinfo.cq_tail);
-			pr_err("  Checkpoint while io_uring is busy is not supported.\n");
-			pr_err("  Ensure application drains io_uring before checkpoint.\n");
-			goto err;
-		}
-		/* Also check registered resources (less critical but log warning) */
-		if (fdinfo.user_files > 0 || fdinfo.user_bufs > 0) {
-			pr_warn("io_uring fd %d has registered resources: files=%u bufs=%u\n",
-			       fd, fdinfo.user_files, fdinfo.user_bufs);
-			pr_warn("  Registered files/buffers will NOT be restored.\n");
-			/* Continue anyway - registered resources are re-established by app */
 		}
 
 		entry = xmalloc(sizeof(*entry));
 		if (!entry) goto err;
 
 		io_uring_entry__init(entry);
-		entry->id = fd;
-		entry->ino = vma->vm_iouring_ino;
-		/*
-		 * Note: sq_entries and cq_entries are computed from VMA sizes later.
-		 * For now, set them to 0 as placeholder.
-		 */
-		entry->sq_entries = 0;
-		entry->cq_entries = 0;
-
-		/*
-		 * PROPER FIX: Use flags directly from kernel fdinfo (Linux 5.12+).
-		 * This is the authoritative source - no guessing from VMA sizes!
-		 */
-		entry->flags = fdinfo.flags;
-		pr_info("io_uring fd %d: flags from fdinfo = 0x%x\n", fd, fdinfo.flags);
-
-#define IORING_SETUP_SQPOLL (1U << 1)
+		entry->id = fd_info[i].fd;
+		entry->ino = fd_info[i].ino;
+		entry->sq_entries = fd_info[i].sq_entries;
+		entry->cq_entries = fd_info[i].cq_entries;
+		entry->flags = fd_info[i].flags;
 		if (fdinfo.sq_thread >= 0) {
-			/* SQPOLL should already be in fdinfo.flags, but ensure it */
 			if (!(entry->flags & IORING_SETUP_SQPOLL)) {
-				pr_warn("io_uring fd %d: SQPOLL thread exists but flag missing, adding\n", fd);
+				pr_warn("io_uring fd %d: SQPOLL thread exists but flag missing, adding\n",
+					fd_info[i].fd);
 				entry->flags |= IORING_SETUP_SQPOLL;
 			}
 			pr_warn("io_uring fd %d has SQPOLL (thread=%d cpu=%d)\n",
-			       fd, fdinfo.sq_thread, fdinfo.sq_thread_cpu);
+			       fd_info[i].fd, fdinfo.sq_thread, fdinfo.sq_thread_cpu);
 			pr_warn("  WARNING: SQPOLL kernel thread will be RECREATED on restore.\n");
 			pr_warn("  The original thread won't survive. App may need adjustment.\n");
 		}
-
 		entry->sq_thread_cpu = fdinfo.sq_thread_cpu;
 		entry->has_sq_thread_cpu = true;
 		entry->sq_thread_idle = 0;
@@ -545,7 +871,9 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		entry->user_bufs = fdinfo.user_bufs;
 		entry->has_user_bufs = true;
 
-		/* Initialize legacy addresses to 0 */
+		/* Initialize VMA fields - will be populated below */
+		entry->n_vmas = 0;
+		entry->vmas = NULL;
 		entry->sq_ring_addr = 0;
 		entry->sq_ring_size = 0;
 		entry->cq_ring_addr = 0;
@@ -553,42 +881,646 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 		entry->sqe_addr = 0;
 		entry->sqe_size = 0;
 
-		/* Allocate vmas array for ALL VMAs belonging to this inode */
-		entry->n_vmas = count_vmas_for_ino(vmas, vma->vm_iouring_ino);
-		entry->vmas = xmalloc(entry->n_vmas * sizeof(IoUringVma *));
-		if (!entry->vmas) goto err;
-		/* CRITICAL: Zero the array so non-NULL check in add_vma_to_entry works */
-		memset(entry->vmas, 0, entry->n_vmas * sizeof(IoUringVma *));
-		vma_idx = 0;
+		fd_info[i].entry = entry;
+		mme->io_urings[nr++] = entry;
 
-		pr_info("io_uring fd %d (ino %lu): allocating %zu VMAs\n",
-			fd, vma->vm_iouring_ino, entry->n_vmas);
+		pr_info("Created entry for io_uring fd=%d sq_entries=%u expected_sqe_size=%zu\n",
+			fd_info[i].fd, fd_info[i].sq_entries, fd_info[i].expected_sqe_size);
+	}
 
-		/* Add this first VMA to the array */
-		if (add_vma_to_entry(entry, vma, &vma_idx) < 0)
-			goto err;
+	/*
+	 * Scan VMAs to read ring sizes directly from memory.
+	 * We use ring_mask at offset 8 in SQ_RING to get ring_entries.
+	 */
+	pr_info("=== Scanning io_uring VMAs for ring sizes ===\n");
+	list_for_each_entry(vma, &vmas->h, list) {
+		size_t vma_size;
 
-		/* Set legacy single-address fields from this VMA */
-		if (vma->e->pgoff == IORING_OFF_SQ_RING) {
-			entry->sq_ring_addr = vma->e->start;
-			entry->sq_ring_size = vma->e->end - vma->e->start;
-		} else if (vma->e->pgoff == IORING_OFF_CQ_RING) {
-			entry->cq_ring_addr = vma->e->start;
-			entry->cq_ring_size = vma->e->end - vma->e->start;
+		if (!vma_entry_is(vma->e, VMA_AREA_IOURING))
+			continue;
+
+		vma_size = vma->e->end - vma->e->start;
+
+		if (vma->e->pgoff == IORING_OFF_SQ_RING || vma->e->pgoff == 0) {
+			uint32_t ring_entries = 0;
+			if (ring_vma_count >= MAX_IO_URINGS) {
+				pr_warn("  Too many SQ_RING VMAs, skipping\n");
+				continue;
+			}
+
+			ring_vmas[ring_vma_count].addr = vma->e->start;
+			ring_vmas[ring_vma_count].size = vma_size;
+			ring_vmas[ring_vma_count].matched_sqe = 0;
+			ring_vmas[ring_vma_count].assigned_fd = 0;
+			ring_vmas[ring_vma_count].sqe_idx = -1;
+			ring_vmas[ring_vma_count].sqe_size = 0;
+
+			if (vma_strategy == IOURING_VMA_STRAT_RING_MASK) {
+				if (read_ring_entries_from_vma(pid, mem_fd, vma->e->start, &ring_entries) < 0) {
+					pr_warn("  Failed to read ring_mask at 0x%lx\n",
+						(unsigned long)vma->e->start);
+					ring_entries = 0;
+				}
+			}
+			ring_vmas[ring_vma_count].ring_entries = ring_entries;
+
+			pr_info("  SQ_RING VMA addr=0x%lx size=%zu ring_entries=%u\n",
+				(unsigned long)vma->e->start, vma_size, ring_entries);
+			ring_vma_count++;
 		} else if (vma->e->pgoff == IORING_OFF_SQES) {
-			entry->sqe_addr = vma->e->start;
-			entry->sqe_size = vma->e->end - vma->e->start;
+			uint32_t entries_64 = 0;
+			uint32_t entries_128 = 0;
+			if (sqe_vma_count >= MAX_IO_URINGS) {
+				pr_warn("  Too many SQE VMAs, skipping\n");
+				continue;
+			}
+
+			if (vma_size % SIZEOF_SQE_NORMAL == 0)
+				entries_64 = vma_size / SIZEOF_SQE_NORMAL;
+			if (vma_size % SIZEOF_SQE_128 == 0)
+				entries_128 = vma_size / SIZEOF_SQE_128;
+
+			sqe_vmas[sqe_vma_count].addr = vma->e->start;
+			sqe_vmas[sqe_vma_count].size = vma_size;
+			sqe_vmas[sqe_vma_count].entries_64 = entries_64;
+			sqe_vmas[sqe_vma_count].entries_128 = entries_128;
+			sqe_vmas[sqe_vma_count].matched = 0;
+
+			pr_info("  SQE VMA addr=0x%lx size=%zu entries_64=%u entries_128=%u\n",
+				(unsigned long)vma->e->start, vma_size, entries_64, entries_128);
+			sqe_vma_count++;
+		}
+	}
+
+	if (vma_strategy == IOURING_VMA_STRAT_KERNEL_SIZES) {
+		pr_info("=== Matching io_uring VMAs by kernel sizes ===\n");
+
+		/* Match SQE VMAs to fds by expected SQE size */
+		for (i = 0; i < num_io_urings; i++) {
+			int j;
+			uint32_t sqe_size;
+			uint32_t expected_entries;
+			int fallback_idx = -1;
+
+			if (!fd_info[i].entry)
+				continue;
+
+			sqe_size = get_sqe_size_for_flags(fd_info[i].flags);
+			expected_entries = fd_info[i].sq_entries;
+
+			for (j = 0; j < sqe_vma_count; j++) {
+				uint32_t entries = 0;
+
+				if (sqe_vmas[j].matched)
+					continue;
+
+				if (sqe_size == SIZEOF_SQE_128)
+					entries = sqe_vmas[j].entries_128;
+				else
+					entries = sqe_vmas[j].entries_64;
+
+				if (entries == 0)
+					continue;
+
+				if (expected_entries > 0 && entries == expected_entries) {
+					fd_info[i].sqe_vma_idx = j;
+					fd_info[i].expected_sqe_size = sqe_vmas[j].size;
+					break;
+				}
+
+				if (fallback_idx < 0)
+					fallback_idx = j;
+			}
+
+			if (fd_info[i].sqe_vma_idx < 0 && fallback_idx >= 0) {
+				fd_info[i].sqe_vma_idx = fallback_idx;
+				fd_info[i].expected_sqe_size = sqe_vmas[fallback_idx].size;
+				pr_warn("  fd=%d SQE entries mismatch, using fallback SQE VMA at 0x%lx\n",
+					fd_info[i].fd, (unsigned long)sqe_vmas[fallback_idx].addr);
+			}
+
+			if (fd_info[i].sqe_vma_idx >= 0) {
+				sqe_vmas[fd_info[i].sqe_vma_idx].matched = 1;
+				pr_info("  fd=%d matched SQE size=%zu at 0x%lx\n",
+					fd_info[i].fd, fd_info[i].expected_sqe_size,
+					(unsigned long)sqe_vmas[fd_info[i].sqe_vma_idx].addr);
+			}
 		}
 
-		/* Store new entry in array */
-		mme->io_urings[nr++] = entry;
+		/* Match ring VMAs to fds by expected ring size */
+		for (i = 0; i < num_io_urings; i++) {
+			int j, best_idx = -1;
+			size_t best_diff = (size_t)-1;
+			size_t expected = 0;
+			size_t sq_ring_size = 0, cq_ring_size = 0, sqe_size = 0;
+			uint32_t features = 0;
+			uint32_t entries = 0;
+			uint32_t cq_entries = 0;
+			struct io_uring_ring_vma_info *ring;
+			struct io_uring_sqe_vma_info *sqe;
+
+			if (!fd_info[i].entry)
+				continue;
+			if (fd_info[i].sqe_vma_idx < 0)
+				continue;
+
+			sqe = &sqe_vmas[fd_info[i].sqe_vma_idx];
+			if (get_sqe_size_for_flags(fd_info[i].flags) == SIZEOF_SQE_128)
+				entries = sqe->entries_128;
+			else
+				entries = sqe->entries_64;
+
+			if (entries == 0)
+				continue;
+
+			cq_entries = fd_info[i].cq_entries ? fd_info[i].cq_entries : entries * 2;
+			if (calc_kernel_ring_sizes(entries, cq_entries, fd_info[i].flags,
+						   &sq_ring_size, &cq_ring_size,
+						   &sqe_size, &features) < 0)
+				continue;
+
+			expected = (features & IORING_FEAT_SINGLE_MMAP) ?
+				(cq_ring_size > sq_ring_size ? cq_ring_size : sq_ring_size) :
+				sq_ring_size;
+			fd_info[i].expected_ring_size = expected;
+
+			for (j = 0; j < ring_vma_count; j++) {
+				size_t diff;
+				if (ring_vmas[j].assigned_fd)
+					continue;
+				if (ring_vmas[j].size == expected) {
+					best_idx = j;
+					break;
+				}
+				diff = (ring_vmas[j].size > expected) ?
+					(ring_vmas[j].size - expected) : (expected - ring_vmas[j].size);
+				if (diff < best_diff) {
+					best_diff = diff;
+					best_idx = j;
+				}
+			}
+
+			if (best_idx < 0)
+				continue;
+
+			ring = &ring_vmas[best_idx];
+			sqe = &sqe_vmas[fd_info[i].sqe_vma_idx];
+			ring->assigned_fd = 1;
+			ring->matched_sqe = (sqe != NULL);
+			ring->sqe_idx = fd_info[i].sqe_vma_idx;
+			ring->ring_entries = entries;
+			fd_info[i].ring_vma_matched = 1;
+
+			fd_info[i].entry->sq_ring_addr = ring->addr;
+			fd_info[i].entry->sq_ring_size = ring->size;
+			if (sqe) {
+				fd_info[i].entry->sqe_addr = sqe->addr;
+				fd_info[i].entry->sqe_size = sqe->size;
+			}
+
+			if (ring->size != expected) {
+				pr_warn("  fd=%d ring size mismatch: expected=%zu got=%zu\n",
+					fd_info[i].fd, expected, ring->size);
+			} else {
+				pr_info("  fd=%d matched ring size=%zu at 0x%lx\n",
+					fd_info[i].fd, expected, (unsigned long)ring->addr);
+			}
+		}
+	}
+
+	/* Match SQ_RING VMAs to SQE VMAs by ring_entries */
+	for (i = 0; i < ring_vma_count; i++) {
+		int j;
+		uint32_t ring_entries = ring_vmas[i].ring_entries;
+		if (ring_entries == 0)
+			continue;
+
+		for (j = 0; j < sqe_vma_count; j++) {
+			if (sqe_vmas[j].matched)
+				continue;
+			if (sqe_vmas[j].entries_64 == ring_entries) {
+				ring_vmas[i].matched_sqe = 1;
+				ring_vmas[i].sqe_idx = j;
+				ring_vmas[i].sqe_size = SIZEOF_SQE_NORMAL;
+				sqe_vmas[j].matched = 1;
+				pr_info("  Matched ring_entries=%u to SQE VMA addr=0x%lx (64B)\n",
+					ring_entries, (unsigned long)sqe_vmas[j].addr);
+				break;
+			}
+			if (sqe_vmas[j].entries_128 == ring_entries) {
+				ring_vmas[i].matched_sqe = 1;
+				ring_vmas[i].sqe_idx = j;
+				ring_vmas[i].sqe_size = SIZEOF_SQE_128;
+				sqe_vmas[j].matched = 1;
+				pr_info("  Matched ring_entries=%u to SQE VMA addr=0x%lx (128B)\n",
+					ring_entries, (unsigned long)sqe_vmas[j].addr);
+				break;
+			}
+		}
+		if (!ring_vmas[i].matched_sqe) {
+			pr_warn("  No SQE VMA match for ring_entries=%u\n", ring_entries);
+		}
+	}
+
+	/* Fallback: pair remaining ring/SQE VMAs by size order */
+	for (i = 0; i < ring_vma_count; i++) {
+		int j;
+		size_t best_size = 0;
+		int best_idx = -1;
+
+		if (ring_vmas[i].matched_sqe)
+			continue;
+
+		for (j = 0; j < sqe_vma_count; j++) {
+			if (sqe_vmas[j].matched)
+				continue;
+			if (sqe_vmas[j].size > best_size) {
+				best_size = sqe_vmas[j].size;
+				best_idx = j;
+			}
+		}
+
+		if (best_idx >= 0) {
+			uint32_t entries = 0;
+			uint32_t sqe_size = SIZEOF_SQE_NORMAL;
+
+			if (sqe_vmas[best_idx].entries_64 > 0) {
+				entries = sqe_vmas[best_idx].entries_64;
+				sqe_size = SIZEOF_SQE_NORMAL;
+			} else if (sqe_vmas[best_idx].entries_128 > 0) {
+				entries = sqe_vmas[best_idx].entries_128;
+				sqe_size = SIZEOF_SQE_128;
+			}
+
+			ring_vmas[i].matched_sqe = 1;
+			ring_vmas[i].sqe_idx = best_idx;
+			ring_vmas[i].sqe_size = sqe_size;
+			if (ring_vmas[i].ring_entries == 0)
+				ring_vmas[i].ring_entries = entries;
+			sqe_vmas[best_idx].matched = 1;
+
+			pr_warn("  Fallback paired ring VMA 0x%lx with SQE VMA 0x%lx (entries=%u)\n",
+				(unsigned long)ring_vmas[i].addr,
+				(unsigned long)sqe_vmas[best_idx].addr,
+				ring_vmas[i].ring_entries);
+		}
+	}
+
+	/* Assign ring+SQE groups to fds */
+	{
+		int sqpoll_fd_idx = -1;
+		int max_ring_idx = -1;
+		uint32_t max_entries = 0;
+		size_t max_size = 0;
+
+		for (i = 0; i < num_io_urings; i++) {
+			if (fd_info[i].sq_thread >= 0) {
+				sqpoll_fd_idx = i;
+				break;
+			}
+		}
+
+		if (sqpoll_fd_idx >= 0) {
+			for (i = 0; i < ring_vma_count; i++) {
+				if (ring_vmas[i].assigned_fd)
+					continue;
+				if (ring_vmas[i].ring_entries > max_entries ||
+				    (ring_vmas[i].ring_entries == max_entries &&
+				     ring_vmas[i].size > max_size)) {
+					max_entries = ring_vmas[i].ring_entries;
+					max_size = ring_vmas[i].size;
+					max_ring_idx = i;
+				}
+			}
+		}
+
+		if (sqpoll_fd_idx >= 0 && max_ring_idx >= 0) {
+			struct io_uring_ring_vma_info *ring = &ring_vmas[max_ring_idx];
+			struct io_uring_sqe_vma_info *sqe =
+				(ring->sqe_idx >= 0) ? &sqe_vmas[ring->sqe_idx] : NULL;
+			entry = fd_info[sqpoll_fd_idx].entry;
+			if (entry) {
+				entry->sq_ring_addr = ring->addr;
+				entry->sq_ring_size = ring->size;
+				if (sqe) {
+					entry->sqe_addr = sqe->addr;
+					entry->sqe_size = sqe->size;
+				}
+				if (ring->ring_entries > 0) {
+					entry->sq_entries = ring->ring_entries;
+					if (entry->sq_mask == 0)
+						entry->sq_mask = ring->ring_entries - 1;
+				}
+				fd_info[sqpoll_fd_idx].ring_vma_matched = 1;
+				ring->assigned_fd = 1;
+				pr_info("  Assigned SQPOLL fd=%d to ring_entries=%u\n",
+					fd_info[sqpoll_fd_idx].fd, ring->ring_entries);
+			}
+		}
+
+		for (i = 0; i < ring_vma_count; i++) {
+			int fd_idx;
+			struct io_uring_ring_vma_info *ring = &ring_vmas[i];
+			struct io_uring_sqe_vma_info *sqe =
+				(ring->sqe_idx >= 0) ? &sqe_vmas[ring->sqe_idx] : NULL;
+
+			if (ring->assigned_fd)
+				continue;
+
+			for (fd_idx = 0; fd_idx < num_io_urings; fd_idx++) {
+				if (!fd_info[fd_idx].ring_vma_matched) {
+					entry = fd_info[fd_idx].entry;
+					if (!entry)
+						continue;
+					entry->sq_ring_addr = ring->addr;
+					entry->sq_ring_size = ring->size;
+					if (sqe) {
+						entry->sqe_addr = sqe->addr;
+						entry->sqe_size = sqe->size;
+					}
+					if (ring->ring_entries > 0) {
+						entry->sq_entries = ring->ring_entries;
+						if (entry->sq_mask == 0)
+							entry->sq_mask = ring->ring_entries - 1;
+					}
+					fd_info[fd_idx].ring_vma_matched = 1;
+					ring->assigned_fd = 1;
+					pr_info("  Assigned fd=%d to ring_entries=%u\n",
+						fd_info[fd_idx].fd, ring->ring_entries);
+					break;
+				}
+			}
+		}
+	}
+
+	/* Log summary of VMA matching */
+	pr_info("=== VMA matching complete ===\n");
+	for (i = 0; i < num_io_urings; i++) {
+		entry = fd_info[i].entry;
+		if (entry) {
+			pr_info("  fd=%d: sqe_addr=0x%lx sqe_size=%zu sq_ring_addr=0x%lx sq_ring_size=%zu\n",
+				fd_info[i].fd,
+				(unsigned long)entry->sqe_addr, (size_t)entry->sqe_size,
+				(unsigned long)entry->sq_ring_addr, (size_t)entry->sq_ring_size);
+		}
+	}
+
+	/* Build VMA lists for each entry (required for restore mapping) */
+	for (i = 0; i < num_io_urings; i++) {
+		int vma_idx = 0;
+		size_t count = 0;
+
+		entry = fd_info[i].entry;
+		if (!entry)
+			continue;
+
+		if (entry->sq_ring_addr && entry->sq_ring_size)
+			count++;
+		if (entry->cq_ring_addr && entry->cq_ring_size)
+			count++;
+		if (entry->sqe_addr && entry->sqe_size)
+			count++;
+
+		if (count == 0)
+			continue;
+
+		entry->n_vmas = count;
+		entry->vmas = xmalloc(entry->n_vmas * sizeof(IoUringVma *));
+		if (!entry->vmas)
+			goto err;
+		memset(entry->vmas, 0, entry->n_vmas * sizeof(IoUringVma *));
+
+		if (entry->sq_ring_addr && entry->sq_ring_size) {
+			if (append_iouring_vma(entry, entry->sq_ring_addr, entry->sq_ring_size,
+					       IORING_OFF_SQ_RING, &vma_idx) < 0)
+				goto err;
+		}
+		if (entry->cq_ring_addr && entry->cq_ring_size) {
+			if (append_iouring_vma(entry, entry->cq_ring_addr, entry->cq_ring_size,
+					       IORING_OFF_CQ_RING, &vma_idx) < 0)
+				goto err;
+		}
+		if (entry->sqe_addr && entry->sqe_size) {
+			if (append_iouring_vma(entry, entry->sqe_addr, entry->sqe_size,
+					       IORING_OFF_SQES, &vma_idx) < 0)
+				goto err;
+		}
+	}
+
+	/* Finalize sq_entries/cq_entries using ring info or SQE VMA size */
+	for (i = 0; i < num_io_urings; i++) {
+		entry = fd_info[i].entry;
+		if (!entry)
+			continue;
+
+		if (entry->sq_entries == 0 && entry->sqe_size > 0) {
+			uint32_t sqe_size = get_sqe_size_for_flags(entry->flags);
+			entry->sq_entries = entry->sqe_size / sqe_size;
+			if (entry->sq_mask == 0 && entry->sq_entries > 0)
+				entry->sq_mask = entry->sq_entries - 1;
+		}
+
+		if (entry->cq_entries == 0) {
+			if (entry->cq_mask > 0)
+				entry->cq_entries = entry->cq_mask + 1;
+			else if (entry->sq_entries > 0)
+				entry->cq_entries = entry->sq_entries * 2;
+		}
+	}
+
+	/*
+	 * CRITICAL FIX: Scan for io_uring fds WITHOUT VMA mappings.
+	 *
+	 * Some io_urings (like libuv's "ctl" ring used for epoll batching)
+	 * may not have any VMA mappings in /proc/pid/maps. These io_urings
+	 * are skipped by the VMA-based loop above, but MUST still be dumped
+	 * and restored - otherwise the fd gets allocated to something else
+	 * after restore, causing EBADF errors.
+	 *
+	 * We scan /proc/pid/fd for io_uring links and create entries for any
+	 * io_urings not already captured via VMAs.
+	 */
+	{
+		char fd_dir[64];
+		DIR *dir;
+		struct dirent *de;
+		int extra_count = 0;
+
+		snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+		dir = opendir(fd_dir);
+		if (dir) {
+			/* First pass: count io_uring fds not in our list */
+			while ((de = readdir(dir)) != NULL) {
+				char link[256], path[64];
+				struct stat st;
+				int fd_num, fd_already_captured, j;
+
+				if (de->d_name[0] == '.') continue;
+				fd_num = atoi(de->d_name);
+				snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd_num);
+
+				{
+					ssize_t len = readlink(path, link, sizeof(link) - 1);
+					if (len < 0)
+						continue;
+					link[len] = '\0';
+				}
+				if (!strstr(link, "io_uring")) continue;
+				if (fstatat(dirfd(dir), de->d_name, &st, 0) < 0) continue;
+
+				/* If we have a map, only accept mapped fds. */
+				if (map_count > 0 &&
+				    !find_iouring_map_entry(map_entries, map_count, fd_num))
+					continue;
+
+				/* Check if this FD is already captured.
+				 * Note: We check by fd number, not inode, because
+				 * multiple io_urings may share the same inode
+				 * (e.g., libuv's ctl and iou rings both report
+				 * the same inode in fdinfo but are different rings).
+				 */
+				fd_already_captured = 0;
+				for (j = 0; j < nr; j++) {
+					if (mme->io_urings[j] && mme->io_urings[j]->id == fd_num) {
+						fd_already_captured = 1;
+						break;
+					}
+				}
+				if (!fd_already_captured) {
+					extra_count++;
+				}
+			}
+
+			if (extra_count > 0) {
+				size_t new_size;
+				IoUringEntry **new_arr;
+
+				pr_warn("Found %d io_uring fd(s) without VMA mappings - adding them\n",
+					extra_count);
+
+				/* Expand io_urings array to fit additional entries */
+				new_size = (nr + extra_count) * sizeof(IoUringEntry *);
+				new_arr = xrealloc(mme->io_urings, new_size);
+				if (!new_arr) {
+					closedir(dir);
+					goto err;
+				}
+				mme->io_urings = new_arr;
+
+				/* Second pass: create entries for unmapped io_urings */
+				rewinddir(dir);
+				while ((de = readdir(dir)) != NULL) {
+					char link[256], path[64];
+					struct stat st;
+					int fd_num, fd_already_captured, j;
+					struct io_uring_fdinfo fdinfo_extra;
+
+					if (de->d_name[0] == '.') continue;
+					fd_num = atoi(de->d_name);
+					snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd_num);
+
+					{
+						ssize_t len = readlink(path, link, sizeof(link) - 1);
+						if (len < 0)
+							continue;
+						link[len] = '\0';
+					}
+					if (!strstr(link, "io_uring")) continue;
+					if (fstatat(dirfd(dir), de->d_name, &st, 0) < 0) continue;
+
+					/* Skip if already captured (check by fd number) */
+					fd_already_captured = 0;
+					for (j = 0; j < nr; j++) {
+						if (mme->io_urings[j] && mme->io_urings[j]->id == fd_num) {
+							fd_already_captured = 1;
+							break;
+						}
+					}
+					if (fd_already_captured)
+						continue;
+
+					/* If we have a map, only accept mapped fds. */
+					if (map_count > 0 &&
+					    !find_iouring_map_entry(map_entries, map_count, fd_num))
+						continue;
+
+					/* Parse fdinfo for this io_uring */
+					if (parse_io_uring_fdinfo(proc_fd, fd_num, &fdinfo_extra) < 0) {
+						pr_err("Can't parse fdinfo for io_uring fd %d (no VMAs)\n", fd_num);
+						continue; /* Skip but don't fail entirely */
+					}
+
+					/* Check quiescence */
+					if (fdinfo_extra.sq_head != fdinfo_extra.sq_tail ||
+					    fdinfo_extra.cq_head != fdinfo_extra.cq_tail) {
+						pr_err("io_uring fd %d (no VMAs) has pending I/O - cannot checkpoint\n",
+						       fd_num);
+						closedir(dir);
+						goto err;
+					}
+
+					/* Create a new entry for this io_uring without VMAs */
+					entry = xmalloc(sizeof(*entry));
+					if (!entry) {
+						closedir(dir);
+						goto err;
+					}
+
+					io_uring_entry__init(entry);
+					entry->id = fd_num;
+					entry->ino = st.st_ino;
+					entry->flags = fdinfo_extra.flags;
+					entry->sq_thread_cpu = fdinfo_extra.sq_thread_cpu;
+					entry->has_sq_thread_cpu = true;
+					entry->sq_thread_idle = 0;
+					entry->has_sq_thread_idle = true;
+					entry->sq_mask = fdinfo_extra.sq_mask;
+					entry->sq_head = fdinfo_extra.sq_head;
+					entry->sq_tail = fdinfo_extra.sq_tail;
+					entry->cached_sq_head = fdinfo_extra.cached_sq_head;
+					entry->cq_mask = fdinfo_extra.cq_mask;
+					entry->cq_head = fdinfo_extra.cq_head;
+					entry->cq_tail = fdinfo_extra.cq_tail;
+					entry->cached_cq_tail = fdinfo_extra.cached_cq_tail;
+					entry->sqes = fdinfo_extra.sqes;
+					entry->cqes = fdinfo_extra.cqes;
+					entry->user_files = fdinfo_extra.user_files;
+					entry->has_user_files = true;
+					entry->user_bufs = fdinfo_extra.user_bufs;
+					entry->has_user_bufs = true;
+
+					/* No VMAs for this io_uring */
+					entry->n_vmas = 0;
+					entry->vmas = NULL;
+					entry->sq_ring_addr = 0;
+					entry->sq_ring_size = 0;
+					entry->cq_ring_addr = 0;
+					entry->cq_ring_size = 0;
+					entry->sqe_addr = 0;
+					entry->sqe_size = 0;
+
+					/* Compute entries from masks */
+					entry->sq_entries = fdinfo_extra.sq_mask > 0 ?
+						fdinfo_extra.sq_mask + 1 : 64;
+					entry->cq_entries = fdinfo_extra.cq_mask > 0 ?
+						fdinfo_extra.cq_mask + 1 : entry->sq_entries * 2;
+
+					pr_info("Added io_uring fd %d (ino %lu, no VMAs): SQ=%u CQ=%u flags=0x%x\n",
+						fd_num, st.st_ino, entry->sq_entries,
+						entry->cq_entries, entry->flags);
+
+					mme->io_urings[nr++] = entry;
+				}
+			}
+			closedir(dir);
+		}
 	}
 
 	/*
 	 * Second pass: finalize all entries and write file entries.
 	 * This is done after all VMAs are collected so we have complete info.
 	 */
-	for (int i = 0; i < nr; i++) {
+	for (i = 0; i < nr; i++) {
 		IoUringFileEntry iufe = IO_URING_FILE_ENTRY__INIT;
 		FileEntry fe = FILE_ENTRY__INIT;
 
@@ -675,6 +1607,8 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 	mme->n_io_urings = nr;
 	ret = 0;
 err:
+	if (mem_fd >= 0)
+		close(mem_fd);
 	close(proc_fd);
 	return ret;
 }
