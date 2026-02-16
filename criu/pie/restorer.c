@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <sys/inotify.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 
 #include "linux/userfaultfd.h"
 
@@ -1134,6 +1135,7 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	unsigned long sq_ring_size, cq_ring_size, sqe_size;
 	int single_mmap;
 	int sqpoll_was_stripped = 0;
+	unsigned int i;
 
 	pr_info("Restoring io_uring ring: fd=%u sq=%u cq=%u sq_addr=0x%lx sq_size=%lu sqe_addr=0x%lx sqe_size=%lu\n",
 		ring->fd, ring->sq_entries, ring->cq_entries,
@@ -1409,7 +1411,29 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		pr_info("  Moved fd from %d to %u\n", fd, ring->fd);
 	}
 
-	pr_info("Restored io_uring ring at fd=%u\n", ring->fd);
+	/* Apply deferred epoll registrations.
+	 * During epoll restore, io_uring tfds were detected and deferred because
+	 * the rings didn't exist yet. Now that the ring is created at the correct
+	 * fd, register it with each epoll instance that was monitoring it. */
+	pr_info("io_uring fd %u: n_epoll_refs=%u\n", ring->fd, ring->n_epoll_refs);
+	for (i = 0; i < ring->n_epoll_refs; i++) {
+		struct epoll_event ev;
+		ev.events = ring->epoll_refs[i].events;
+		ev.data.u64 = ring->epoll_refs[i].data;
+		ret = sys_epoll_ctl(ring->epoll_refs[i].epoll_fd,
+				    EPOLL_CTL_ADD,
+				    ring->fd, &ev);
+		if (ret < 0) {
+			pr_err("io_uring fd %u: epoll_ctl(ADD) epfd=%u err=%d\n",
+			       ring->fd, ring->epoll_refs[i].epoll_fd, (int)ret);
+		} else {
+			pr_info("io_uring fd %u: epoll registered epfd=%u ev=0x%x\n",
+				ring->fd, ring->epoll_refs[i].epoll_fd,
+				ring->epoll_refs[i].events);
+		}
+	}
+
+	pr_info("Restored io_uring ring fd=%u epoll_refs=%u\n", ring->fd, ring->n_epoll_refs);
 	return 0;
 }
 
