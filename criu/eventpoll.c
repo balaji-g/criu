@@ -467,19 +467,6 @@ static int eventpoll_retore_tfd(int fd, int id, EventpollTfdEntry *tdefe)
 
 	event.events = tdefe->events;
 	event.data.u64 = tdefe->data;
-	/*
-	 * libuv stores epoll data as fd (not pointer). If we see a pointer-like
-	 * value paired with a small tfd, prefer the fd to avoid bogus watcher
-	 * indices after restore.
-	 */
-	if (tdefe->tfd < 1024 &&
-	    tdefe->data != (uint64_t)tdefe->tfd &&
-	    tdefe->data >= 0x00007f0000000000ULL &&
-	    tdefe->data <= 0x00007fffffffffffULL) {
-		pr_warn("epoll: tfd %d has pointer-like data 0x%llx, using fd value\n",
-			tdefe->tfd, (unsigned long long)tdefe->data);
-		event.data.u64 = (uint64_t)tdefe->tfd;
-	}
 	if (epoll_ctl(fd, EPOLL_CTL_ADD, tdefe->tfd, &event)) {
 		int err = errno;
 		if (err == EBADF) {
