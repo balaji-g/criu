@@ -378,6 +378,16 @@ static int dump_one_eventpoll(int lfd, u32 id, const struct fd_parms *p)
 			pr_info_eventpoll_tfd("Dumping: ", e->id, e->tfd[i]);
 	}
 
+	/* [CKPT-DIAG] Log epoll summary with data pattern for debugging */
+	pr_warn("[CKPT-DIAG] epoll id=%#x fd=%d n_tfd=%zu\n",
+		e->id, p->fd, e->n_tfd);
+	for (i = 0; i < e->n_tfd; i++) {
+		pr_warn("[CKPT-DIAG]   tfd=%d events=0x%x data=0x%016" PRIx64 "%s\n",
+			e->tfd[i]->tfd, e->tfd[i]->events, e->tfd[i]->data,
+			(e->tfd[i]->data >= 0x7f0000000000ULL) ? " [PTR]" :
+			(e->tfd[i]->data < 0x10000) ? " [FD]" : " [HEAP]");
+	}
+
 out:
 	for (i = 0; e && i < e->n_tfd; i++)
 		eventpoll_tfd_entry__free_unpacked(e->tfd[i], NULL);
@@ -467,6 +477,8 @@ static int eventpoll_retore_tfd(int fd, int id, EventpollTfdEntry *tdefe)
 
 	event.events = tdefe->events;
 	event.data.u64 = tdefe->data;
+	pr_warn("[CKPT-DIAG] epoll_ctl(ADD) epfd=%d tfd=%d events=0x%x data=0x%016" PRIx64 "\n",
+		fd, tdefe->tfd, tdefe->events, tdefe->data);
 	if (epoll_ctl(fd, EPOLL_CTL_ADD, tdefe->tfd, &event)) {
 		int err = errno;
 		if (err == EBADF) {

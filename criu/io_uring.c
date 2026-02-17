@@ -614,15 +614,14 @@ static int prescan_io_uring_fds(pid_t pid, int proc_fd,
 		if (map_count > 0) {
 			const struct io_uring_map_entry *m =
 				find_iouring_map_entry(map, map_count, fd_num);
-			if (!m) {
-				pr_warn("Pre-scan: fd=%d io_uring not in map, skipping\n", fd_num);
-				continue;
+			if (m) {
+				fd_info[count].sq_entries = m->sq_entries;
+				fd_info[count].cq_entries = m->cq_entries;
+				fd_info[count].flags = m->flags;
+				pr_info("Pre-scan: fd=%d using map sq=%u cq=%u flags=0x%x\n",
+					fd_num, m->sq_entries, m->cq_entries, m->flags);
 			}
-			fd_info[count].sq_entries = m->sq_entries;
-			fd_info[count].cq_entries = m->cq_entries;
-			fd_info[count].flags = m->flags;
-			pr_info("Pre-scan: fd=%d using map sq=%u cq=%u flags=0x%x\n",
-				fd_num, m->sq_entries, m->cq_entries, m->flags);
+			/* Don't skip fds not in map — map may be from another process */
 		}
 
 		/* Store fd info */
@@ -775,11 +774,48 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 	int sqe_vma_count = 0;
 	enum io_uring_vma_strategy vma_strategy;
 
+	/* Zero-init to prevent stack garbage in fields not set by prescan */
+	memset(fd_info, 0, sizeof(fd_info));
+	memset(ring_vmas, 0, sizeof(ring_vmas));
+	memset(sqe_vmas, 0, sizeof(sqe_vmas));
+
 	/*
 	 * Note: We no longer early-return if nr_iourings == 0.
 	 * Some io_urings may have no VMA mappings but still need to be dumped.
 	 * We scan /proc/pid/fd below to catch these.
 	 */
+
+	/* [CKPT-DIAG] Scan and log all fd types for this process */
+	{
+		char diag_dir[64];
+		DIR *diag_d;
+		struct dirent *diag_de;
+		int n_iouring = 0, n_epoll = 0, n_eventfd = 0, n_socket = 0;
+
+		snprintf(diag_dir, sizeof(diag_dir), "/proc/%d/fd", pid);
+		diag_d = opendir(diag_dir);
+		if (diag_d) {
+			while ((diag_de = readdir(diag_d)) != NULL) {
+				char diag_link[256], diag_path[PATH_MAX];
+				ssize_t diag_len;
+				if (diag_de->d_name[0] == '.') continue;
+				snprintf(diag_path, sizeof(diag_path),
+					 "/proc/%d/fd/%s", pid, diag_de->d_name);
+				diag_len = readlink(diag_path, diag_link,
+						    sizeof(diag_link) - 1);
+				if (diag_len < 0) continue;
+				diag_link[diag_len] = '\0';
+				if (strstr(diag_link, "io_uring")) n_iouring++;
+				else if (strstr(diag_link, "eventpoll")) n_epoll++;
+				else if (strstr(diag_link, "eventfd")) n_eventfd++;
+				else if (strstr(diag_link, "socket")) n_socket++;
+			}
+			closedir(diag_d);
+		}
+		pr_warn("[CKPT-DIAG] pid %d: io_uring=%d epoll=%d eventfd=%d socket=%d vma_iourings=%u\n",
+			pid, n_iouring, n_epoll, n_eventfd, n_socket, vmas->nr_iourings);
+	}
+
 	if (vmas->nr_iourings > 0) {
 		pr_info("Dumping %u io_uring VMA(s)\n", vmas->nr_iourings);
 	}
@@ -1368,10 +1404,7 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 				if (!strstr(link, "io_uring")) continue;
 				if (fstatat(dirfd(dir), de->d_name, &st, 0) < 0) continue;
 
-				/* If we have a map, only accept mapped fds. */
-				if (map_count > 0 &&
-				    !find_iouring_map_entry(map_entries, map_count, fd_num))
-					continue;
+				/* Don't skip fds not in map — map may be from another process */
 
 				/* Check if this FD is already captured.
 				 * Note: We check by fd number, not inode, because
@@ -1439,10 +1472,7 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 					if (fd_already_captured)
 						continue;
 
-					/* If we have a map, only accept mapped fds. */
-					if (map_count > 0 &&
-					    !find_iouring_map_entry(map_entries, map_count, fd_num))
-						continue;
+					/* Don't skip fds not in map — map may be from another process */
 
 					/* Parse fdinfo for this io_uring */
 					if (parse_io_uring_fdinfo(proc_fd, fd_num, &fdinfo_extra) < 0) {
@@ -1499,11 +1529,23 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 					entry->sqe_addr = 0;
 					entry->sqe_size = 0;
 
-					/* Compute entries from masks */
-					entry->sq_entries = fdinfo_extra.sq_mask > 0 ?
+					/* Compute entries and sanitize for VMA-less rings.
+				 * fdinfo parsing may return garbage for some fields.
+				 * Use sane defaults — kernel will round up anyway.
+				 */
+					entry->sq_entries = (fdinfo_extra.sq_mask > 0 &&
+						fdinfo_extra.sq_mask < 65536) ?
 						fdinfo_extra.sq_mask + 1 : 64;
-					entry->cq_entries = fdinfo_extra.cq_mask > 0 ?
+					entry->cq_entries = (fdinfo_extra.cq_mask > 0 &&
+						fdinfo_extra.cq_mask < 65536) ?
 						fdinfo_extra.cq_mask + 1 : entry->sq_entries * 2;
+					/* Sanitize flags — only keep known io_uring setup flags */
+#define KNOWN_IOURING_FLAGS 0x3ffff  /* bits 0-17 are valid setup flags */
+					if (entry->flags & ~KNOWN_IOURING_FLAGS) {
+						pr_warn("io_uring fd %d: suspicious flags 0x%x, clearing unknown bits\n",
+							fd_num, entry->flags);
+						entry->flags &= KNOWN_IOURING_FLAGS;
+					}
 
 					pr_info("Added io_uring fd %d (ino %lu, no VMAs): SQ=%u CQ=%u flags=0x%x\n",
 						fd_num, st.st_ino, entry->sq_entries,
@@ -1605,6 +1647,24 @@ int dump_io_uring(MmEntry *mme, struct vm_area_list *vmas, pid_t pid)
 	}
 
 	mme->n_io_urings = nr;
+
+	/* [CKPT-DIAG] Summary of what was captured */
+	pr_warn("[CKPT-DIAG] pid %d: dumped %d io_uring ring(s) (vma_tagged=%u, fd_scanned=%d)\n",
+		pid, nr, vmas->nr_iourings, num_io_urings);
+	{
+		int k;
+		for (k = 0; k < nr; k++) {
+			IoUringEntry *e = mme->io_urings[k];
+			if (e) {
+				pr_warn("[CKPT-DIAG]   ring %d: fd=%d sq=%u cq=%u flags=0x%x "
+					"sq_ring=0x%lx sqe=0x%lx n_vmas=%zu\n",
+					k, e->id, e->sq_entries, e->cq_entries, e->flags,
+					(unsigned long)e->sq_ring_addr,
+					(unsigned long)e->sqe_addr, e->n_vmas);
+			}
+		}
+	}
+
 	ret = 0;
 err:
 	if (mem_fd >= 0)

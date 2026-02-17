@@ -582,12 +582,13 @@ static int dump_task_mm(pid_t pid, const struct proc_pid_stat *stat, const struc
 		}
 	}
 
-	/* Dump io_uring rings */
-	if (vma_area_list->nr_iourings) {
-		ret = dump_io_uring(&mme, (struct vm_area_list *)vma_area_list, pid);
-		if (ret)
-			goto err;
-	}
+	/* Dump io_uring rings — always scan, not just when VMAs detected.
+	 * Child processes (e.g., c10d scheduler) may have io_uring fds
+	 * (libuv ctl rings) whose VMAs aren't tagged as VMA_AREA_IOURING.
+	 */
+	ret = dump_io_uring(&mme, (struct vm_area_list *)vma_area_list, pid);
+	if (ret)
+		goto err;
 
 	mme.mm_start_code = stat->start_code;
 	mme.mm_end_code = stat->end_code;

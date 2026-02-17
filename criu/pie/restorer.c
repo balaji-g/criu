@@ -1144,7 +1144,14 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 
 	/* Set up the ring configuration */
 	params.sq_entries = ring->sq_entries;
-	params.cq_entries = ring->cq_entries;
+	/* For VMA-less rings (e.g., libuv ctl ring), let kernel choose CQ size */
+	if (ring->sq_ring_addr == 0 && ring->cq_entries > ring->sq_entries * 4) {
+		pr_info("  VMA-less ring: cq_entries=%u looks invalid, using sq*2=%u\n",
+			ring->cq_entries, ring->sq_entries * 2);
+		params.cq_entries = ring->sq_entries * 2;
+	} else {
+		params.cq_entries = ring->cq_entries;
+	}
 	params.flags = ring->flags;
 
 	/*
