@@ -1312,59 +1312,30 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	}
 
 	/*
-	 * CRITICAL: Synchronize ring indices with application's cached state!
+	 * Ring index synchronization: leave at kernel defaults (all zeros).
 	 *
-	 * The kernel's new io_uring starts with all indices at 0, but libuv
-	 * has cached values in its heap memory from the checkpoint.
-	 * If these don't match, io_uring operations will fail.
+	 * io_uring_setup() initializes both shared memory AND the kernel's
+	 * internal cached_sq_head to 0. Writing non-zero values to shared
+	 * memory does NOT update cached_sq_head. If we set shared sq_head
+	 * to N, the kernel still thinks cached_sq_head=0, and the next
+	 * io_uring_enter() processes N phantom SQEs (garbage/NOP), returning
+	 * N+submitted instead of submitted. libuv checks rc==n and aborts.
 	 *
-	 * Strategy: Set kernel indices to match checkpointed values in EMPTY state:
-	 * - SQ: head = tail = checkpointed tail (queue empty, at libuv's position)
-	 * - CQ: head = tail = checkpointed head (queue empty, at libuv's position)
-	 *
-	 * This keeps the rings empty (no stale data) while matching libuv's expectations.
+	 * libuv reads sq_head/sq_tail from shared memory on every access
+	 * (no internal caching), so leaving them at 0 is safe — libuv sees
+	 * an empty ring at position 0 and submits new SQEs starting there.
 	 */
 	if (ring->sq_ring_addr) {
-		/*
-		 * Ring indices are at kernel-provided offsets.
-		 * 
-		 * IMPORTANT: With IORING_FEAT_SINGLE_MMAP, SQ and CQ share the same
-		 * mapping, so cq_off is relative to sq_ring_addr. Without single_mmap,
-		 * CQ has its own mapping at cq_ring_addr, and cq_off is relative to that.
-		 */
-		unsigned long cq_base_addr;
 		volatile uint32_t *sq_head;
 		volatile uint32_t *sq_tail;
-		volatile uint32_t *cq_head;
-		volatile uint32_t *cq_tail;
-
-		cq_base_addr = single_mmap ? ring->sq_ring_addr : ring->cq_ring_addr;
-		if (!cq_base_addr)
-			cq_base_addr = ring->sq_ring_addr;  /* Fallback for safety */
 
 		sq_head = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.head);
 		sq_tail = (uint32_t *)((char *)ring->sq_ring_addr + params.sq_off.tail);
-		cq_head = (uint32_t *)((char *)cq_base_addr + params.cq_off.head);
-		cq_tail = (uint32_t *)((char *)cq_base_addr + params.cq_off.tail);
 
-		pr_info("  Ring index sync: checkpointed sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u\n",
+		pr_info("  Ring indices: sq_head=%u sq_tail=%u (left at kernel default 0)\n",
+			*sq_head, *sq_tail);
+		pr_info("  (checkpointed: sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u)\n",
 			ring->sq_head, ring->sq_tail, ring->cq_head, ring->cq_tail);
-		pr_info("  Kernel initialized: sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u\n",
-			*sq_head, *sq_tail, *cq_head, *cq_tail);
-
-		/*
-		 * Set indices to make rings empty at the checkpointed position:
-		 * - SQ empty: sq_head = sq_tail = checkpointed sq_tail
-		 * - CQ empty: cq_head = cq_tail = checkpointed cq_head
-		 */
-		*sq_head = ring->sq_tail;
-		*sq_tail = ring->sq_tail;
-		*cq_head = ring->cq_head;
-		*cq_tail = ring->cq_head;
-
-		pr_info("  Synchronized: sq_head=%u sq_tail=%u cq_head=%u cq_tail=%u (rings empty)\n",
-			*sq_head, *sq_tail, *cq_head, *cq_tail);
-
 	}
 
 	/* If the fd doesn't match, dup2 it to the expected fd */
