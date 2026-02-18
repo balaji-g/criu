@@ -1152,6 +1152,9 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 		params.cq_entries = ring->cq_entries;
 	}
 	params.flags = ring->flags;
+	if (ring->sq_thread_cpu >= 0)
+		params.sq_thread_cpu = ring->sq_thread_cpu;
+	params.sq_thread_idle = ring->sq_thread_idle;
 
 	/* Create a new io_uring instance */
 	fd = sys_io_uring_setup(ring->sq_entries, &params);
@@ -1299,13 +1302,13 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 	 * libuv/uvloop expects sqarray[i] == i; after restore it can be zeroed.
 	 * This is safe for any io_uring user and prevents uv__io_poll crashes.
 	 */
-	if (ring->sq_ring_addr && params.sq_off.array && params.sq_off.ring_entries) {
+	if (ring->sq_ring_addr && params.sq_off.array && params.sq_entries) {
 		__u32 *sq_array = (__u32 *)((char *)ring->sq_ring_addr + params.sq_off.array);
 		__u32 i;
-		for (i = 0; i < params.sq_off.ring_entries; i++)
+		for (i = 0; i < params.sq_entries; i++)
 			sq_array[i] = i;
 		pr_info("  Initialized sqarray identity mapping (%u entries)\n",
-			params.sq_off.ring_entries);
+			params.sq_entries);
 	}
 
 	/*
