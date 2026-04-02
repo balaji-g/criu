@@ -681,22 +681,30 @@ static int get_container_pid(int host_pid)
 /*
  * Reset CUDA driver init state in a frozen process to allow cuInit reinit.
  *
- * The CUDA driver uses a `pidLocks` struct (separate from `globals`) to gate
- * one-time initialization via cuiGlobalMutexInitOnce(). It contains 4 PID
- * fields: initOnceBeginPid, initOnceEndPid, apiInitOnceBeginPid, apiInitOnceEndPid.
- * All set to the process PID during first cuInit.
+ * After CRIU restore, three things block cuInit from reinitializing:
  *
- * After CRIU restore with PID preservation, pidLocks still has the original PID.
- * cuiGlobalMutexInitOnce sees initOnceBeginPid == thisPid and skips reinit.
+ * 1. pidLocks.initOnceBeginPid == getpid() → cuiGlobalMutexInitOnce thinks
+ *    init already happened, spins on initOnceEndPid, returns immediately.
+ *    Fix: zero all 4 pidLocks fields → first-init path (InitializeCriticalSections only).
  *
- * By zeroing pidLocks, cuiGlobalMutexInitOnce enters the "else" branch which:
- *   1. memset(&globals, 0, sizeof(globals)) — full globals reset
- *   2. InitializeCriticalSections() — fresh mutexes
- *   3. cuInit proceeds with full driver initialization
+ * 2. globals.initialized == 0x00ABC123 (CUDA_GLOBALS_INITIALIZED) → cuiInit
+ *    early-returns success without calling globalsInit().
+ *    Fix: zero it → cuiInit proceeds past the early-return.
  *
- * We scan libcuda.so's writable segment for 4 consecutive int32 fields all
- * matching the container PID — that's the pidLocks struct (16 bytes).
+ * 3. globals.pid != 0 → cuiInit returns CUDA_ERROR_NOT_INITIALIZED (fork guard).
+ *    Fix: zero it → cuiInit proceeds to globalsInit() which reopens /dev/nvidia*,
+ *    creates RM client, enumerates devices.
+ *
+ * With all three zeroed, cuInit(0) does a full reinitialization from scratch.
+ *
+ * Scan strategy:
+ *   pidLocks: two consecutive int32 both == container_pid (unique pattern).
+ *   globals.initialized: scan for 0x00ABC123 (CUDA_GLOBALS_INITIALIZED).
+ *   globals.pid: scan for container_pid as int32 within 8KB after globals.initialized
+ *     (verified offset ~0xFB8 in driver 580.95.05).
  */
+
+#define CUDA_GLOBALS_INITIALIZED_MAGIC 0x00ABC123
 
 static int patch_libcuda_globals(int host_pid)
 {
@@ -704,8 +712,6 @@ static int patch_libcuda_globals(int host_pid)
 	if (container_pid <= 0)
 		return 0;
 
-	/* Read checkpoint path from env (set by restore-entrypoint before criu restore).
-	 * get_images_dir() returns CWD when opts.imgs_dir is null during RPC restore. */
 	const char *ckpt_dir = getenv("CRYO_CHECKPOINT_PATH");
 	if (!ckpt_dir)
 		ckpt_dir = get_images_dir();
@@ -744,18 +750,15 @@ static int patch_libcuda_globals(int host_pid)
 			continue;
 		}
 
-		/* Scan for pidLocks: two consecutive int32 both == container_pid.
-		 * Confirmed by diagnostic: pidLocks layout is [pid, pid, 0, 0]
-		 * (initOnceBeginPid, initOnceEndPid, apiInitOnceBeginPid=0, apiInitOnceEndPid=0).
-		 * globals.pid is an isolated match — NOT consecutive. */
 		int32_t pid32 = (int32_t)container_pid;
+
+		/* --- 1. Zero pidLocks (consecutive pair scan) --- */
 		for (size_t off = 0; off + 2 * sizeof(int32_t) <= seg_size; off += 4) {
 			int32_t v0, v1;
 			memcpy(&v0, buf + off, sizeof(v0));
 			memcpy(&v1, buf + off + 4, sizeof(v1));
 
 			if (v0 == pid32 && v1 == pid32) {
-				/* Found pidLocks — zero all 16 bytes (4 fields) */
 				unsigned char zeros[16] = {0};
 				if (pwrite(mem_fd, zeros, sizeof(zeros),
 					   (off_t)(seg_addr + off)) == sizeof(zeros)) {
@@ -768,6 +771,64 @@ static int patch_libcuda_globals(int host_pid)
 				break;
 			}
 		}
+
+		/* --- 2. Zero globals.initialized (0x00ABC123) --- */
+		uint32_t init_magic = CUDA_GLOBALS_INITIALIZED_MAGIC;
+		ssize_t init_off = -1;
+		for (size_t off = 0; off + sizeof(uint32_t) <= seg_size; off += 4) {
+			uint32_t val;
+			memcpy(&val, buf + off, sizeof(val));
+			if (val == init_magic) {
+				uint32_t zero = 0;
+				if (pwrite(mem_fd, &zero, sizeof(zero),
+					   (off_t)(seg_addr + off)) == sizeof(zero)) {
+					pr_info("CUDA plugin: zeroed globals.initialized at 0x%lx "
+						"(seg+0x%lx, host pid %d)\n",
+						seg_addr + off, (unsigned long)off, host_pid);
+					init_off = (ssize_t)off;
+					patched++;
+				}
+				break;
+			}
+		}
+
+		/* --- 3. Zero globals.pid (container PID near globals.initialized) ---
+		 * globals.pid is at a known offset after globals.initialized in the
+		 * CUglobals struct (~0xFB8 bytes in driver 580.95.05). Scan a window
+		 * of 8KB after globals.initialized for an isolated int32 match.
+		 * "Isolated" = not part of pidLocks (not a consecutive pair). */
+		if (init_off >= 0) {
+			size_t search_start = (size_t)init_off;
+			size_t search_end = search_start + 8192;
+			if (search_end > seg_size)
+				search_end = seg_size;
+
+			for (size_t off = search_start; off + sizeof(int32_t) <= search_end; off += 4) {
+				int32_t val;
+				memcpy(&val, buf + off, sizeof(val));
+				if (val != pid32)
+					continue;
+
+				/* Skip if this is part of a consecutive pair (pidLocks) */
+				int32_t next = 0;
+				if (off + 2 * sizeof(int32_t) <= seg_size)
+					memcpy(&next, buf + off + 4, sizeof(next));
+				if (next == pid32)
+					continue;
+
+				uint32_t zero = 0;
+				if (pwrite(mem_fd, &zero, sizeof(zero),
+					   (off_t)(seg_addr + off)) == sizeof(zero)) {
+					pr_info("CUDA plugin: zeroed globals.pid at 0x%lx "
+						"(seg+0x%lx, value=%d, host pid %d)\n",
+						seg_addr + off, (unsigned long)off,
+						container_pid, host_pid);
+					patched++;
+				}
+				break;
+			}
+		}
+
 		free(buf);
 	}
 
