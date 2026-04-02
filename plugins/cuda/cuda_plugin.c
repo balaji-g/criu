@@ -697,14 +697,38 @@ static int get_container_pid(int host_pid)
  *
  * With all three zeroed, cuInit(0) does a full reinitialization from scratch.
  *
+ * Strategy: trigger the CUDA driver's own "forked-child" cleanup path.
+ *
+ * cuiGlobalMutexInitOnce() (cuiinit.c:6486) checks pidLocks.initOnceBeginPid:
+ *   - If == getpid(): already initialized, spin-wait
+ *   - If != getpid() AND != 0: forked-child → DeleteCriticalSections() +
+ *       memset(&globals, 0, sizeof(globals)) + InitializeCriticalSections()
+ *   - If == 0: first-init → just InitializeCriticalSections() (NO globals reset)
+ *
+ * The forked-child path is exactly what we need: it destroys stale mutexes
+ * safely (pthread_mutex_destroy on valid-but-stale locks), zeros ALL globals
+ * (device pointers, RM handles, contexts, etc.), then reinitializes mutexes.
+ *
+ * HOWEVER, the forked-child path preserves globals.pid:
+ *   pid = globals.pid; memset(&globals, 0, sizeof(globals)); globals.pid = pid;
+ * Then cuiInit checks: if (globals.pid != 0) → CUDA_ERROR_NOT_INITIALIZED.
+ *
+ * Fix: zero globals.pid FIRST, then set pidLocks sentinel. The forked-child
+ * path saves pid=0, memsets, restores pid=0 → cuiInit proceeds.
+ *
+ * Patch order (must be this order):
+ *   1. Zero globals.pid → so forked-child path saves/restores 0
+ *   2. Set pidLocks.initOnceBeginPid = sentinel → triggers forked-child path
+ *      (memset(&globals, 0) resets globals.initialized and everything else)
+ *
  * Scan strategy:
- *   pidLocks: two consecutive int32 both == container_pid (unique pattern).
- *   globals.initialized: scan for 0x00ABC123 (CUDA_GLOBALS_INITIALIZED).
- *   globals.pid: scan for container_pid as int32 within 8KB after globals.initialized
- *     (verified offset ~0xFB8 in driver 580.95.05).
+ *   globals.initialized (0x00ABC123): unique magic value, scan segment
+ *   globals.pid: container PID within 8KB after globals.initialized
+ *   pidLocks: two consecutive int32 == container_pid
  */
 
 #define CUDA_GLOBALS_INITIALIZED_MAGIC 0x00ABC123
+#define PIDLOCKS_SENTINEL 0xCF10DEAD  /* non-zero, won't match any real PID */
 
 static int patch_libcuda_globals(int host_pid)
 {
@@ -752,51 +776,27 @@ static int patch_libcuda_globals(int host_pid)
 
 		int32_t pid32 = (int32_t)container_pid;
 
-		/* --- 1. Zero pidLocks (consecutive pair scan) --- */
-		for (size_t off = 0; off + 2 * sizeof(int32_t) <= seg_size; off += 4) {
-			int32_t v0, v1;
-			memcpy(&v0, buf + off, sizeof(v0));
-			memcpy(&v1, buf + off + 4, sizeof(v1));
-
-			if (v0 == pid32 && v1 == pid32) {
-				unsigned char zeros[16] = {0};
-				if (pwrite(mem_fd, zeros, sizeof(zeros),
-					   (off_t)(seg_addr + off)) == sizeof(zeros)) {
-					pr_info("CUDA plugin: zeroed pidLocks at 0x%lx "
-						"(seg+0x%lx, pid=%d, host pid %d)\n",
-						seg_addr + off, (unsigned long)off,
-						container_pid, host_pid);
-					patched++;
-				}
-				break;
-			}
-		}
-
-		/* --- 2. Zero globals.initialized (0x00ABC123) --- */
+		/* --- 1. Find and zero globals.pid ---
+		 * Must happen BEFORE pidLocks sentinel so the forked-child
+		 * path in cuiGlobalMutexInitOnce saves/restores pid=0.
+		 *
+		 * Locate globals.initialized (0x00ABC123) first as anchor,
+		 * then scan within 8KB for globals.pid (isolated PID match). */
 		uint32_t init_magic = CUDA_GLOBALS_INITIALIZED_MAGIC;
 		ssize_t init_off = -1;
+
 		for (size_t off = 0; off + sizeof(uint32_t) <= seg_size; off += 4) {
 			uint32_t val;
 			memcpy(&val, buf + off, sizeof(val));
 			if (val == init_magic) {
-				uint32_t zero = 0;
-				if (pwrite(mem_fd, &zero, sizeof(zero),
-					   (off_t)(seg_addr + off)) == sizeof(zero)) {
-					pr_info("CUDA plugin: zeroed globals.initialized at 0x%lx "
-						"(seg+0x%lx, host pid %d)\n",
-						seg_addr + off, (unsigned long)off, host_pid);
-					init_off = (ssize_t)off;
-					patched++;
-				}
+				init_off = (ssize_t)off;
+				pr_info("CUDA plugin: found globals.initialized at 0x%lx "
+					"(seg+0x%lx, host pid %d)\n",
+					seg_addr + off, (unsigned long)off, host_pid);
 				break;
 			}
 		}
 
-		/* --- 3. Zero globals.pid (container PID near globals.initialized) ---
-		 * globals.pid is at a known offset after globals.initialized in the
-		 * CUglobals struct (~0xFB8 bytes in driver 580.95.05). Scan a window
-		 * of 8KB after globals.initialized for an isolated int32 match.
-		 * "Isolated" = not part of pidLocks (not a consecutive pair). */
 		if (init_off >= 0) {
 			size_t search_start = (size_t)init_off;
 			size_t search_end = search_start + 8192;
@@ -809,7 +809,7 @@ static int patch_libcuda_globals(int host_pid)
 				if (val != pid32)
 					continue;
 
-				/* Skip if this is part of a consecutive pair (pidLocks) */
+				/* Skip consecutive pairs (that's pidLocks, not globals.pid) */
 				int32_t next = 0;
 				if (off + 2 * sizeof(int32_t) <= seg_size)
 					memcpy(&next, buf + off + 4, sizeof(next));
@@ -823,6 +823,34 @@ static int patch_libcuda_globals(int host_pid)
 						"(seg+0x%lx, value=%d, host pid %d)\n",
 						seg_addr + off, (unsigned long)off,
 						container_pid, host_pid);
+					patched++;
+				}
+				break;
+			}
+		}
+
+		/* --- 2. Set pidLocks sentinel (triggers forked-child cleanup) ---
+		 * Write sentinel to initOnceBeginPid, zero the other 3 fields.
+		 * cuiGlobalMutexInitOnce sees oldBeginPid=sentinel != thisPid,
+		 * oldBeginPid != 0 → forked-child path:
+		 *   DeleteCriticalSections()  (safe: mutexes valid from pre-checkpoint)
+		 *   memset(&globals, 0, sizeof(globals))  (zeros EVERYTHING)
+		 *   globals.pid = saved_pid  (restores 0, since we zeroed it above)
+		 *   InitializeCriticalSections()  (fresh mutexes)
+		 */
+		for (size_t off = 0; off + 2 * sizeof(int32_t) <= seg_size; off += 4) {
+			int32_t v0, v1;
+			memcpy(&v0, buf + off, sizeof(v0));
+			memcpy(&v1, buf + off + 4, sizeof(v1));
+
+			if (v0 == pid32 && v1 == pid32) {
+				int32_t sentinel[4] = {PIDLOCKS_SENTINEL, 0, 0, 0};
+				if (pwrite(mem_fd, sentinel, sizeof(sentinel),
+					   (off_t)(seg_addr + off)) == sizeof(sentinel)) {
+					pr_info("CUDA plugin: set pidLocks sentinel at 0x%lx "
+						"(seg+0x%lx, sentinel=0x%x, pid=%d, host pid %d)\n",
+						seg_addr + off, (unsigned long)off,
+						PIDLOCKS_SENTINEL, container_pid, host_pid);
 					patched++;
 				}
 				break;
