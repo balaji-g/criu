@@ -697,38 +697,25 @@ static int get_container_pid(int host_pid)
  *
  * With all three zeroed, cuInit(0) does a full reinitialization from scratch.
  *
- * Strategy: trigger the CUDA driver's own "forked-child" cleanup path.
+ * Strategy: zero libcuda.so's entire .bss section.
  *
- * cuiGlobalMutexInitOnce() (cuiinit.c:6486) checks pidLocks.initOnceBeginPid:
- *   - If == getpid(): already initialized, spin-wait
- *   - If != getpid() AND != 0: forked-child → DeleteCriticalSections() +
- *       memset(&globals, 0, sizeof(globals)) + InitializeCriticalSections()
- *   - If == 0: first-init → just InitializeCriticalSections() (NO globals reset)
+ * The .bss section contains all zero-initialized globals, including:
+ *   - CUglobals globals = {0}  (huge struct: mutexes, device state, RM handles)
+ *   - CUlocks pidLocks         (4 PID fields gating cuiGlobalMutexInitOnce)
  *
- * The forked-child path is exactly what we need: it destroys stale mutexes
- * safely (pthread_mutex_destroy on valid-but-stale locks), zeros ALL globals
- * (device pointers, RM handles, contexts, etc.), then reinitializes mutexes.
+ * Zeroing .bss restores libcuda.so to its "as-loaded" state:
+ *   - pidLocks = 0 → cuiGlobalMutexInitOnce takes first-init path
+ *   - globals.initialized = 0 → cuiInit proceeds past early-return
+ *   - globals.pid = 0 → cuiInit proceeds past fork guard
+ *   - All mutexes = 0 → InitializeCriticalSections reinits cleanly
+ *     (cuiMutexInitialize does memset(m,0) before cuosInitMutex)
+ *   - All stale RM handles, device pointers, contexts = 0
  *
- * HOWEVER, the forked-child path preserves globals.pid:
- *   pid = globals.pid; memset(&globals, 0, sizeof(globals)); globals.pid = pid;
- * Then cuiInit checks: if (globals.pid != 0) → CUDA_ERROR_NOT_INITIALIZED.
+ * The checkpoint side saves .bss-only boundaries (p_memsz - p_filesz from
+ * PT_LOAD), so .data (non-zero initialized globals) is NOT touched.
  *
- * Fix: zero globals.pid FIRST, then set pidLocks sentinel. The forked-child
- * path saves pid=0, memsets, restores pid=0 → cuiInit proceeds.
- *
- * Patch order (must be this order):
- *   1. Zero globals.pid → so forked-child path saves/restores 0
- *   2. Set pidLocks.initOnceBeginPid = sentinel → triggers forked-child path
- *      (memset(&globals, 0) resets globals.initialized and everything else)
- *
- * Scan strategy:
- *   globals.initialized (0x00ABC123): unique magic value, scan segment
- *   globals.pid: container PID within 8KB after globals.initialized
- *   pidLocks: two consecutive int32 == container_pid
+ * The libcuda-bss-<pid>.txt files contain: <addr> <size> per line.
  */
-
-#define CUDA_GLOBALS_INITIALIZED_MAGIC 0x00ABC123
-#define PIDLOCKS_SENTINEL 0xCF10DEAD  /* non-zero, won't match any real PID */
 
 static int patch_libcuda_globals(int host_pid)
 {
@@ -764,100 +751,24 @@ static int patch_libcuda_globals(int host_pid)
 	size_t seg_size;
 
 	while (fscanf(fp, "%lx %zu", &seg_addr, &seg_size) == 2) {
-		unsigned char *buf = (unsigned char *)calloc(1, seg_size);
-		if (!buf)
+		unsigned char *zeros = (unsigned char *)calloc(1, seg_size);
+		if (!zeros)
 			continue;
 
-		ssize_t rd = pread(mem_fd, buf, seg_size, (off_t)seg_addr);
-		if (rd != (ssize_t)seg_size) {
-			free(buf);
-			continue;
+		ssize_t wr = pwrite(mem_fd, zeros, seg_size, (off_t)seg_addr);
+		free(zeros);
+
+		if (wr == (ssize_t)seg_size) {
+			pr_info("CUDA plugin: zeroed .bss at 0x%lx (%zu bytes, "
+				"container pid %d, host pid %d)\n",
+				seg_addr, seg_size, container_pid, host_pid);
+			patched++;
+		} else {
+			pr_warn("CUDA plugin: failed to zero .bss at 0x%lx "
+				"(%zu bytes, wrote %zd, host pid %d): %s\n",
+				seg_addr, seg_size, wr, host_pid,
+				strerror(errno));
 		}
-
-		int32_t pid32 = (int32_t)container_pid;
-
-		/* --- 1. Find and zero globals.pid ---
-		 * Must happen BEFORE pidLocks sentinel so the forked-child
-		 * path in cuiGlobalMutexInitOnce saves/restores pid=0.
-		 *
-		 * Locate globals.initialized (0x00ABC123) first as anchor,
-		 * then scan within 8KB for globals.pid (isolated PID match). */
-		uint32_t init_magic = CUDA_GLOBALS_INITIALIZED_MAGIC;
-		ssize_t init_off = -1;
-
-		for (size_t off = 0; off + sizeof(uint32_t) <= seg_size; off += 4) {
-			uint32_t val;
-			memcpy(&val, buf + off, sizeof(val));
-			if (val == init_magic) {
-				init_off = (ssize_t)off;
-				pr_info("CUDA plugin: found globals.initialized at 0x%lx "
-					"(seg+0x%lx, host pid %d)\n",
-					seg_addr + off, (unsigned long)off, host_pid);
-				break;
-			}
-		}
-
-		if (init_off >= 0) {
-			size_t search_start = (size_t)init_off;
-			size_t search_end = search_start + 8192;
-			if (search_end > seg_size)
-				search_end = seg_size;
-
-			for (size_t off = search_start; off + sizeof(int32_t) <= search_end; off += 4) {
-				int32_t val;
-				memcpy(&val, buf + off, sizeof(val));
-				if (val != pid32)
-					continue;
-
-				/* Skip consecutive pairs (that's pidLocks, not globals.pid) */
-				int32_t next = 0;
-				if (off + 2 * sizeof(int32_t) <= seg_size)
-					memcpy(&next, buf + off + 4, sizeof(next));
-				if (next == pid32)
-					continue;
-
-				uint32_t zero = 0;
-				if (pwrite(mem_fd, &zero, sizeof(zero),
-					   (off_t)(seg_addr + off)) == sizeof(zero)) {
-					pr_info("CUDA plugin: zeroed globals.pid at 0x%lx "
-						"(seg+0x%lx, value=%d, host pid %d)\n",
-						seg_addr + off, (unsigned long)off,
-						container_pid, host_pid);
-					patched++;
-				}
-				break;
-			}
-		}
-
-		/* --- 2. Set pidLocks sentinel (triggers forked-child cleanup) ---
-		 * Write sentinel to initOnceBeginPid, zero the other 3 fields.
-		 * cuiGlobalMutexInitOnce sees oldBeginPid=sentinel != thisPid,
-		 * oldBeginPid != 0 → forked-child path:
-		 *   DeleteCriticalSections()  (safe: mutexes valid from pre-checkpoint)
-		 *   memset(&globals, 0, sizeof(globals))  (zeros EVERYTHING)
-		 *   globals.pid = saved_pid  (restores 0, since we zeroed it above)
-		 *   InitializeCriticalSections()  (fresh mutexes)
-		 */
-		for (size_t off = 0; off + 2 * sizeof(int32_t) <= seg_size; off += 4) {
-			int32_t v0, v1;
-			memcpy(&v0, buf + off, sizeof(v0));
-			memcpy(&v1, buf + off + 4, sizeof(v1));
-
-			if (v0 == pid32 && v1 == pid32) {
-				int32_t sentinel[4] = {PIDLOCKS_SENTINEL, 0, 0, 0};
-				if (pwrite(mem_fd, sentinel, sizeof(sentinel),
-					   (off_t)(seg_addr + off)) == sizeof(sentinel)) {
-					pr_info("CUDA plugin: set pidLocks sentinel at 0x%lx "
-						"(seg+0x%lx, sentinel=0x%x, pid=%d, host pid %d)\n",
-						seg_addr + off, (unsigned long)off,
-						PIDLOCKS_SENTINEL, container_pid, host_pid);
-					patched++;
-				}
-				break;
-			}
-		}
-
-		free(buf);
 	}
 
 	close(mem_fd);
