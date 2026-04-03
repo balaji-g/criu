@@ -760,73 +760,39 @@ static int patch_libcuda_globals(int host_pid)
 
 	int patched = 0;
 	unsigned long seg_addr;
-	size_t seg_size, bss_offset;
+	size_t seg_size;
 
-	while (fscanf(fp, "%lx %zu %zu", &seg_addr, &seg_size, &bss_offset) == 3) {
+	while (fscanf(fp, "%lx %zu", &seg_addr, &seg_size) == 2) {
+		/* Zero the entire writable segment (.data + .bss).
+		 * This resets all libcuda.so globals to zero, including:
+		 *   - globals struct (mutexes, device state, RM handles)
+		 *   - pidLocks (cuiGlobalMutexInitOnce gate)
+		 *   - tlsGlobals (.data with non-zero init → gets zeroed)
+		 *   - All other static state
+		 *
+		 * cuiMutexInitialize does memset(m,0) before cuosInitMutex,
+		 * so zeroing mutexes in .data is safe (they get re-created).
+		 * cuiTlsInitialize checks tlsGlobals.state==0 and reinits.
+		 *
+		 * Previous concern: zeroing .data broke Python. But that was
+		 * when nvidia FDs were also closed. With FDs+VMAs kept open,
+		 * the kernel RM state is preserved and cuInit can reinit. */
+		unsigned char *zeros = (unsigned char *)calloc(1, seg_size);
+		if (!zeros)
+			continue;
 
-		/* --- 1. Zero .bss section (globals + pidLocks + all zero-init statics) --- */
-		if (bss_offset < seg_size) {
-			size_t bss_size = seg_size - bss_offset;
-			unsigned long bss_addr = seg_addr + bss_offset;
-			unsigned char *zeros = (unsigned char *)calloc(1, bss_size);
-			if (zeros) {
-				ssize_t wr = pwrite(mem_fd, zeros, bss_size, (off_t)bss_addr);
-				free(zeros);
-				if (wr == (ssize_t)bss_size) {
-					pr_info("CUDA plugin: zeroed .bss at 0x%lx (%zu bytes, "
-						"container pid %d, host pid %d)\n",
-						bss_addr, bss_size, container_pid, host_pid);
-					patched++;
-				}
-			}
-		}
+		ssize_t wr = pwrite(mem_fd, zeros, seg_size, (off_t)seg_addr);
+		free(zeros);
 
-		/* --- 2. Reset tlsGlobals.state in .data section ---
-		 * tlsGlobals is in .data (non-zero initializers).
-		 * Scan for three consecutive 0xFFFFFFFF (TLS key sentinels),
-		 * then find state==1 within 32 bytes. Zero it so cuiTlsInitialize
-		 * does a full reset (memset + pthread_key_create). */
-		if (bss_offset > 0) {
-			size_t data_size = bss_offset;
-			unsigned char *buf = (unsigned char *)calloc(1, data_size);
-			if (!buf)
-				continue;
-
-			ssize_t rd = pread(mem_fd, buf, data_size, (off_t)seg_addr);
-			if (rd == (ssize_t)data_size) {
-				for (size_t off = 0; off + 3 * sizeof(uint32_t) <= data_size; off += 4) {
-					uint32_t v0, v1, v2;
-					memcpy(&v0, buf + off, sizeof(v0));
-					memcpy(&v1, buf + off + 4, sizeof(v1));
-					memcpy(&v2, buf + off + 8, sizeof(v2));
-
-					if (v0 != TLS_KEY_SENTINEL || v1 != TLS_KEY_SENTINEL ||
-					    v2 != TLS_KEY_SENTINEL)
-						continue;
-
-					/* Found tlsGlobals start. Scan for state field
-					 * (value 1) within next 32 bytes. */
-					for (size_t s = off + 12; s + sizeof(uint32_t) <= data_size &&
-					     s < off + 44; s += 4) {
-						uint32_t sv;
-						memcpy(&sv, buf + s, sizeof(sv));
-						if (sv == TLS_INITIALIZED_STATE) {
-							uint32_t zero = 0;
-							if (pwrite(mem_fd, &zero, sizeof(zero),
-								   (off_t)(seg_addr + s)) == sizeof(zero)) {
-								pr_info("CUDA plugin: reset tlsGlobals.state "
-									"at 0x%lx (seg+0x%lx, host pid %d)\n",
-									seg_addr + s, (unsigned long)s,
-									host_pid);
-								patched++;
-							}
-							goto tls_done;
-						}
-					}
-				}
-			}
-tls_done:
-			free(buf);
+		if (wr == (ssize_t)seg_size) {
+			pr_info("CUDA plugin: zeroed libcuda segment at 0x%lx "
+				"(%zu bytes, container pid %d, host pid %d)\n",
+				seg_addr, seg_size, container_pid, host_pid);
+			patched++;
+		} else {
+			pr_warn("CUDA plugin: failed to zero segment at 0x%lx "
+				"(%zu bytes, wrote %zd, host pid %d): %s\n",
+				seg_addr, seg_size, wr, host_pid, strerror(errno));
 		}
 	}
 
