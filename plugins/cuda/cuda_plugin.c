@@ -101,19 +101,21 @@ static int zero_libcuda_segment(int host_pid)
 	if (container_pid <= 0)
 		return 0;
 
-	const char *ckpt_dir = getenv("CRYO_CHECKPOINT_PATH");
-	if (!ckpt_dir)
-		ckpt_dir = get_images_dir();
-
+	/* Read .bss segment addresses from /dev/shm inside the container.
+	 * Written at library init time (constructor) — before any quiesce. */
 	char filepath[PATH_MAX];
-	int n = snprintf(filepath, sizeof(filepath), "%s/libcuda-bss-%d.txt",
-			 ckpt_dir, container_pid);
+	int n = snprintf(filepath, sizeof(filepath),
+			 "/proc/%d/root/dev/shm/cryo-libcuda-bss-%d",
+			 host_pid, container_pid);
 	if (n >= (int)sizeof(filepath))
 		return 0;
 
 	FILE *fp = fopen(filepath, "r");
-	if (!fp)
+	if (!fp) {
+		pr_info("CUDA plugin: no .bss info at %s for pid %d\n",
+			filepath, host_pid);
 		return 0;
+	}
 
 	char mem_path[64];
 	snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", host_pid);
