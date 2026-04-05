@@ -54,6 +54,104 @@ bool plugin_added_to_inventory = false;
 
 /* Forward declarations */
 static int scan_and_save_nvidia_fds(int pid);
+static const char *get_images_dir(void);
+
+/*
+ * Get the container (innermost namespace) PID for a host PID.
+ */
+static int get_container_pid(int host_pid)
+{
+	FILE *f;
+	char line[256];
+	char path[64];
+	int container_pid = -1;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", host_pid);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "NSpid:", 6) != 0)
+			continue;
+		char *p = line + 6;
+		char *last_token = NULL;
+		char *tok = strtok(p, " \t\n");
+		while (tok) {
+			last_token = tok;
+			tok = strtok(NULL, " \t\n");
+		}
+		if (last_token)
+			container_pid = atoi(last_token);
+		break;
+	}
+
+	fclose(f);
+	return container_pid;
+}
+
+/*
+ * Zero libcuda.so's writable segment to reset all CUDA globals for cuInit reinit.
+ * Called from resume_devices_late during CRIU restore with LASO mode.
+ * The libcuda-bss-<pid>.txt files are written during checkpoint by the intercept library.
+ */
+static int zero_libcuda_segment(int host_pid)
+{
+	int container_pid = get_container_pid(host_pid);
+	if (container_pid <= 0)
+		return 0;
+
+	const char *ckpt_dir = getenv("CRYO_CHECKPOINT_PATH");
+	if (!ckpt_dir)
+		ckpt_dir = get_images_dir();
+
+	char filepath[PATH_MAX];
+	int n = snprintf(filepath, sizeof(filepath), "%s/libcuda-bss-%d.txt",
+			 ckpt_dir, container_pid);
+	if (n >= (int)sizeof(filepath))
+		return 0;
+
+	FILE *fp = fopen(filepath, "r");
+	if (!fp)
+		return 0;
+
+	char mem_path[64];
+	snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", host_pid);
+	int mem_fd = open(mem_path, O_RDWR);
+	if (mem_fd < 0) {
+		pr_warn("CUDA plugin: can't open %s: %s\n", mem_path, strerror(errno));
+		fclose(fp);
+		return 0;
+	}
+
+	int patched = 0;
+	unsigned long seg_addr;
+	size_t seg_size;
+
+	while (fscanf(fp, "%lx %zu", &seg_addr, &seg_size) == 2) {
+		unsigned char *zeros = (unsigned char *)calloc(1, seg_size);
+		if (!zeros)
+			continue;
+
+		ssize_t wr = pwrite(mem_fd, zeros, seg_size, (off_t)seg_addr);
+		free(zeros);
+
+		if (wr == (ssize_t)seg_size) {
+			pr_info("CUDA plugin: zeroed libcuda segment at 0x%lx "
+				"(%zu bytes, container pid %d, host pid %d)\n",
+				seg_addr, seg_size, container_pid, host_pid);
+			patched++;
+		} else {
+			pr_warn("CUDA plugin: failed to zero segment at 0x%lx "
+				"(%zu bytes, wrote %zd): %s\n",
+				seg_addr, seg_size, wr, strerror(errno));
+		}
+	}
+
+	close(mem_fd);
+	fclose(fp);
+	return patched;
+}
 
 struct pid_info {
 	int pid;
@@ -616,7 +714,15 @@ int cuda_plugin_resume_devices_late(int pid)
 	}
 
 	if (getenv("CRYO_SKIP_CUDA_CHECKPOINT")) {
-		pr_info("skipping cuda-checkpoint resume for pid %d (CRYO_SKIP_CUDA_CHECKPOINT)\n", pid);
+		/* LASO mode: skip cuda-checkpoint Restore+Unlock, but zero libcuda.so's
+		 * writable segment so cuInit can reinitialize from scratch.
+		 * The library calls cuInit(0) after processes resume. */
+		int patched = zero_libcuda_segment(pid);
+		if (patched > 0)
+			pr_info("CUDA plugin: LASO restore: zeroed %d libcuda segments for pid %d\n",
+				patched, pid);
+		else
+			pr_info("CUDA plugin: LASO restore: no libcuda segments for pid %d (non-GPU process)\n", pid);
 		return 0;
 	}
 
