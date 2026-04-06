@@ -682,9 +682,14 @@ int cuda_plugin_update_vma_map(const char *path, const uint64_t addr,
 	static int devzero_fd = -1;
 	int dup_fd;
 
-	/* Check if this is an NVIDIA device path */
-	if (strstr(path, "/dev/nvidia") == NULL && strstr(path, "nvidia-uvm") == NULL) {
-		return -ENOTSUP; /* Not our device */
+	/* Check if this is an NVIDIA device by major number.
+	 * The path comes from CRIU's VMA info — stat it to verify. */
+	{
+		struct stat vma_st;
+		if (stat(path, &vma_st) < 0 || !S_ISCHR(vma_st.st_mode) ||
+		    !is_nvidia_device_major(major(vma_st.st_rdev))) {
+			return -ENOTSUP; /* Not our device */
+		}
 	}
 
 	pr_debug("CUDA plugin: mapping NVIDIA VMA at 0x%lx (%s) to /dev/zero\n",
@@ -888,7 +893,7 @@ static int scan_and_save_nvidia_fds(int pid)
 	}
 
 	while ((entry = readdir(dir)) != NULL) {
-		char fd_path[128];
+		char fd_path[PATH_MAX];
 		char link_target[256];
 		struct stat st;
 		ssize_t len;
@@ -900,24 +905,24 @@ static int scan_and_save_nvidia_fds(int pid)
 		fd_num = atoi(entry->d_name);
 		snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%d", pid, fd_num);
 
-		/* Read the symlink to get the device path */
+		/* Stat the FD directly to get device type and major/minor.
+		 * Uses fstatat on the /proc/pid/fd/N symlink — no need to
+		 * resolve the link target first. This catches ALL nvidia
+		 * devices regardless of path or naming. */
+		if (stat(fd_path, &st) < 0)
+			continue;
+
+		if (!S_ISCHR(st.st_mode))
+			continue;
+
+		if (!is_nvidia_device_major(major(st.st_rdev)))
+			continue;
+
+		/* Read the symlink for the device path (for mapping file) */
 		len = readlink(fd_path, link_target, sizeof(link_target) - 1);
 		if (len <= 0)
 			continue;
 		link_target[len] = '\0';
-
-		/* Check if it's an NVIDIA device */
-		if (strncmp(link_target, "/dev/nvidia", 11) != 0)
-			continue;
-
-		/* Stat the actual device to get major/minor */
-		if (stat(link_target, &st) < 0) {
-			pr_warn("CUDA plugin: can't stat %s\n", link_target);
-			continue;
-		}
-
-		if (!S_ISCHR(st.st_mode))
-			continue;
 
 		/* Create a unique ID from major:minor:fd */
 		unsigned int maj = major(st.st_rdev);
@@ -943,7 +948,7 @@ static int scan_and_save_nvidia_fds(int pid)
 int cuda_plugin_dump_file(int fd, int id)
 {
 	struct stat st;
-	char path[256];
+	char path[PATH_MAX];
 	char fd_link[64];
 	ssize_t len;
 
@@ -975,14 +980,30 @@ int cuda_plugin_dump_file(int fd, int id)
 		path[len] = '\0';
 		save_nvidia_file_mapping(id, path);
 	} else {
-		/* Fallback based on minor number */
-		if (minor(st.st_rdev) == 255) {
-			save_nvidia_file_mapping(id, "/dev/nvidiactl");
-		} else if (minor(st.st_rdev) == 0 && major(st.st_rdev) != 195) {
-			save_nvidia_file_mapping(id, "/dev/nvidia-uvm");
-		} else {
-			snprintf(path, sizeof(path), "/dev/nvidia%d", minor(st.st_rdev));
+		/* Readlink failed — scan /dev for matching major:minor */
+		unsigned int dmaj = major(st.st_rdev);
+		unsigned int dmin = minor(st.st_rdev);
+		DIR *devdir = opendir("/dev");
+		bool found = false;
+		if (devdir) {
+			struct dirent *de;
+			while ((de = readdir(devdir)) != NULL) {
+				struct stat devst;
+				snprintf(path, sizeof(path), "/dev/%s", de->d_name);
+				if (stat(path, &devst) == 0 && S_ISCHR(devst.st_mode) &&
+				    major(devst.st_rdev) == dmaj && minor(devst.st_rdev) == dmin) {
+					save_nvidia_file_mapping(id, path);
+					found = true;
+					break;
+				}
+			}
+			closedir(devdir);
+		}
+		if (!found) {
+			snprintf(path, sizeof(path), "/dev/nvidia-unknown-%u-%u", dmaj, dmin);
 			save_nvidia_file_mapping(id, path);
+			pr_warn("CUDA plugin: couldn't find device for major %u minor %u, "
+				"using placeholder path\n", dmaj, dmin);
 		}
 	}
 
@@ -1004,7 +1025,7 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__DUMP_EXT_FILE, cuda_plugin_dump_file)
 #define MAX_NVIDIA_FILES 512
 static struct {
 	int id;
-	char path[256];
+	char path[PATH_MAX];
 } nvidia_file_map[MAX_NVIDIA_FILES];
 static int nvidia_file_map_count = 0;
 static bool nvidia_file_map_loaded = false;
@@ -1014,7 +1035,7 @@ static void load_nvidia_file_mappings(void)
 	char img_path[PATH_MAX];
 	FILE *fp;
 	int id;
-	char path[256];
+	char path[PATH_MAX];
 	const char *dir;
 
 	if (nvidia_file_map_loaded)
@@ -1080,26 +1101,45 @@ int cuda_plugin_restore_file(int id, bool *retry_needed)
 			path, id, strerror(errno));
 	}
 
-	/* Fallback: try common NVIDIA device paths */
-	const char *fallback_paths[] = {
-		"/dev/nvidia0",
-		"/dev/nvidiactl",
-		"/dev/nvidia-uvm",
-		"/dev/nvidia-modeset",
-		NULL
-	};
-
-	for (int i = 0; fallback_paths[i]; i++) {
-		fd = open(fallback_paths[i], O_RDWR);
-		if (fd >= 0) {
-			pr_debug("CUDA plugin: restored id 0x%x as %s (fallback, fd=%d)\n",
-				id, fallback_paths[i], fd);
-			return fd;
+	/* Fallback: try to reconstruct device path from the ID.
+	 * ID format: (major << 20) | (minor << 8) | (fd_num & 0xFF)
+	 * We can extract major/minor and scan /dev for a matching device. */
+	{
+		unsigned int id_major = (id >> 20) & 0xFFF;
+		unsigned int id_minor = (id >> 8) & 0xFFF;
+		DIR *devdir = opendir("/dev");
+		if (devdir) {
+			struct dirent *de;
+			while ((de = readdir(devdir)) != NULL) {
+				char devpath[PATH_MAX];
+				struct stat devst;
+				snprintf(devpath, sizeof(devpath), "/dev/%s", de->d_name);
+				if (stat(devpath, &devst) < 0)
+					continue;
+				if (!S_ISCHR(devst.st_mode))
+					continue;
+				if (major(devst.st_rdev) == id_major &&
+				    minor(devst.st_rdev) == id_minor) {
+					fd = open(devpath, O_RDWR);
+					if (fd >= 0) {
+						pr_info("CUDA plugin: restored id 0x%x as %s "
+							"(fallback by major:minor %u:%u, fd=%d)\n",
+							id, devpath, id_major, id_minor, fd);
+						closedir(devdir);
+						return fd;
+					}
+				}
+			}
+			closedir(devdir);
 		}
 	}
 
-	pr_err("CUDA plugin: can't restore id 0x%x - all paths failed\n", id);
-	return -ENOENT;
+	/* Return -ENOTSUP (not -ENOENT) so CRIU knows this plugin can't handle
+	 * this file and tries other restore methods. -ENOENT means "file doesn't
+	 * exist" which causes CRIU to abort. -ENOTSUP means "not my file." */
+	pr_debug("CUDA plugin: id 0x%x (major=%u minor=%u) not an NVIDIA device, returning ENOTSUP\n",
+		id, (id >> 20) & 0xFFF, (id >> 8) & 0xFFF);
+	return -ENOTSUP;
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESTORE_EXT_FILE, cuda_plugin_restore_file)
 
