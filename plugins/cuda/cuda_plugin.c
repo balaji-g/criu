@@ -921,9 +921,12 @@ int cuda_plugin_dump_file(int fd, int id)
 		return -ENOTSUP; /* Can't stat, not our file */
 	}
 
-	/* Check if this is a character device with an NVIDIA major */
-	if (!S_ISCHR(st.st_mode) || !is_nvidia_device_major(major(st.st_rdev))) {
-		return -ENOTSUP; /* Not an NVIDIA device */
+	/* Handle any character device — not just NVIDIA.
+	 * CRIU calls DUMP_EXT_FILE for devices it can't dump natively.
+	 * We save the path + major:minor so we can reopen/mknod on restore.
+	 * This covers nvidia, gdrdrv, and any future GPU-related drivers. */
+	if (!S_ISCHR(st.st_mode)) {
+		return -ENOTSUP; /* Not a character device */
 	}
 
 	/*
