@@ -813,58 +813,23 @@ static bool is_nvidia_device_major(unsigned int maj)
 #define NVIDIA_FILES_IMG "nvidia-files.img"
 static FILE *nvidia_files_fp = NULL;
 
-/*
- * Get the directory path for checkpoint images (nvidia-files.img).
- *
- * During RPC mode:
- * - opts.imgs_dir is set from ImagesDirFd (checkpoint directory)
- * - opts.work_dir is set from WorkDirFd (could be /tmp for temp mounts)
- *
- * We MUST prefer opts.imgs_dir because that's where checkpoint images live.
- * WorkDirFd might point to a different directory just for temp files.
- *
- * Falls back to CWD as last resort (CRIU chdir's during dump).
- */
-static const char *get_images_dir(void)
-{
-	/* Primary: images directory (where checkpoint data lives) */
-	if (opts.imgs_dir && opts.imgs_dir[0]) {
-		pr_debug("CUDA plugin: using opts.imgs_dir=%s\n", opts.imgs_dir);
-		return opts.imgs_dir;
-	}
-
-	/*
-	 * Fallback: work directory (only if imgs_dir is truly empty).
-	 * During dump via RPC, work_dir may equal imgs_dir.
-	 * During restore, work_dir might be /tmp - AVOID this for images!
-	 */
-	if (opts.work_dir && opts.work_dir[0] &&
-	    strncmp(opts.work_dir, "/tmp", 4) != 0) {
-		pr_debug("CUDA plugin: using opts.work_dir=%s (imgs_dir empty)\n", opts.work_dir);
-		return opts.work_dir;
-	}
-
-	/* Last resort: current directory (CRIU chdir's to images during dump) */
-	pr_debug("CUDA plugin: using CWD (imgs_dir=%s, work_dir=%s)\n",
-		opts.imgs_dir ? opts.imgs_dir : "null",
-		opts.work_dir ? opts.work_dir : "null");
-	return ".";
-}
-
 static void save_nvidia_file_mapping(int id, const char *path)
 {
 	if (!nvidia_files_fp) {
-		char img_path[PATH_MAX];
-		const char *dir = get_images_dir();
-
-		snprintf(img_path, sizeof(img_path), "%s/%s", dir, NVIDIA_FILES_IMG);
-		pr_info("CUDA plugin: saving NVIDIA mappings to %s (dir=%s)\n", img_path, dir);
-
-		nvidia_files_fp = fopen(img_path, "w");
-		if (!nvidia_files_fp) {
-			pr_perror("Failed to create %s", img_path);
+		int img_dir_fd = criu_get_image_dir();
+		int fd = openat(img_dir_fd, NVIDIA_FILES_IMG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd < 0) {
+			pr_perror("Failed to create %s via openat(img_dir_fd=%d)", NVIDIA_FILES_IMG, img_dir_fd);
 			return;
 		}
+		nvidia_files_fp = fdopen(fd, "w");
+		if (!nvidia_files_fp) {
+			pr_perror("Failed to fdopen %s", NVIDIA_FILES_IMG);
+			close(fd);
+			return;
+		}
+		pr_info("CUDA plugin: saving NVIDIA mappings via openat(img_dir_fd=%d, %s)\n",
+			img_dir_fd, NVIDIA_FILES_IMG);
 	}
 	fprintf(nvidia_files_fp, "%d %s\n", id, path);
 	fflush(nvidia_files_fp);
@@ -1032,26 +997,31 @@ static bool nvidia_file_map_loaded = false;
 
 static void load_nvidia_file_mappings(void)
 {
-	char img_path[PATH_MAX];
 	FILE *fp;
-	int id;
+	int id, fd;
 	char path[PATH_MAX];
-	const char *dir;
+	int img_dir_fd;
 
 	if (nvidia_file_map_loaded)
 		return;
 	nvidia_file_map_loaded = true;
 
-	dir = get_images_dir();
-	snprintf(img_path, sizeof(img_path), "%s/%s", dir, NVIDIA_FILES_IMG);
-	pr_info("CUDA plugin: loading NVIDIA mappings from %s (dir=%s)\n", img_path, dir);
-
-	fp = fopen(img_path, "r");
-	if (!fp) {
-		pr_warn("CUDA plugin: no %s found at %s, using fallback restore\n",
-			NVIDIA_FILES_IMG, img_path);
+	img_dir_fd = criu_get_image_dir();
+	fd = openat(img_dir_fd, NVIDIA_FILES_IMG, O_RDONLY);
+	if (fd < 0) {
+		pr_warn("CUDA plugin: no %s found via openat(img_dir_fd=%d) (errno=%d: %s), using fallback\n",
+			NVIDIA_FILES_IMG, img_dir_fd, errno, strerror(errno));
 		return;
 	}
+	fp = fdopen(fd, "r");
+	if (!fp) {
+		pr_warn("CUDA plugin: fdopen failed for %s (errno=%d: %s)\n",
+			NVIDIA_FILES_IMG, errno, strerror(errno));
+		close(fd);
+		return;
+	}
+	pr_info("CUDA plugin: loading NVIDIA mappings via openat(img_dir_fd=%d, %s)\n",
+		img_dir_fd, NVIDIA_FILES_IMG);
 
 	while (fscanf(fp, "%d %255s", &id, path) == 2) {
 		if (nvidia_file_map_count >= MAX_NVIDIA_FILES) {
