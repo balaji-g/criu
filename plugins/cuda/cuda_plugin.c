@@ -813,7 +813,7 @@ static bool is_nvidia_device_major(unsigned int maj)
 #define NVIDIA_FILES_IMG "nvidia-files.img"
 static FILE *nvidia_files_fp = NULL;
 
-static void save_nvidia_file_mapping(int id, const char *path)
+static void save_nvidia_file_mapping(int id, unsigned int maj, unsigned int min, const char *path)
 {
 	if (!nvidia_files_fp) {
 		int img_dir_fd = criu_get_image_dir();
@@ -831,9 +831,9 @@ static void save_nvidia_file_mapping(int id, const char *path)
 		pr_info("CUDA plugin: saving NVIDIA mappings via openat(img_dir_fd=%d, %s)\n",
 			img_dir_fd, NVIDIA_FILES_IMG);
 	}
-	fprintf(nvidia_files_fp, "%d %s\n", id, path);
+	fprintf(nvidia_files_fp, "%d %u %u %s\n", id, maj, min, path);
 	fflush(nvidia_files_fp);
-	pr_debug("CUDA plugin: saved mapping id=0x%x -> %s\n", id, path);
+	pr_debug("CUDA plugin: saved mapping id=0x%x -> %s (dev %u:%u)\n", id, path, maj, min);
 }
 
 /*
@@ -894,7 +894,7 @@ static int scan_and_save_nvidia_fds(int pid)
 		unsigned int min = minor(st.st_rdev);
 		int id = (maj << 20) | (min << 8) | (fd_num & 0xFF);
 
-		save_nvidia_file_mapping(id, link_target);
+		save_nvidia_file_mapping(id, maj, min, link_target);
 		count++;
 
 		pr_debug("CUDA plugin: found NVIDIA fd %d -> %s (id=0x%x)\n",
@@ -939,15 +939,15 @@ int cuda_plugin_dump_file(int fd, int id)
 	}
 
 	/* Get the actual device path */
+	unsigned int dmaj = major(st.st_rdev);
+	unsigned int dmin = minor(st.st_rdev);
 	snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%d", fd);
 	len = readlink(fd_link, path, sizeof(path) - 1);
 	if (len > 0) {
 		path[len] = '\0';
-		save_nvidia_file_mapping(id, path);
+		save_nvidia_file_mapping(id, dmaj, dmin, path);
 	} else {
 		/* Readlink failed — scan /dev for matching major:minor */
-		unsigned int dmaj = major(st.st_rdev);
-		unsigned int dmin = minor(st.st_rdev);
 		DIR *devdir = opendir("/dev");
 		bool found = false;
 		if (devdir) {
@@ -957,7 +957,7 @@ int cuda_plugin_dump_file(int fd, int id)
 				snprintf(path, sizeof(path), "/dev/%s", de->d_name);
 				if (stat(path, &devst) == 0 && S_ISCHR(devst.st_mode) &&
 				    major(devst.st_rdev) == dmaj && minor(devst.st_rdev) == dmin) {
-					save_nvidia_file_mapping(id, path);
+					save_nvidia_file_mapping(id, dmaj, dmin, path);
 					found = true;
 					break;
 				}
@@ -966,7 +966,7 @@ int cuda_plugin_dump_file(int fd, int id)
 		}
 		if (!found) {
 			snprintf(path, sizeof(path), "/dev/nvidia-unknown-%u-%u", dmaj, dmin);
-			save_nvidia_file_mapping(id, path);
+			save_nvidia_file_mapping(id, dmaj, dmin, path);
 			pr_warn("CUDA plugin: couldn't find device for major %u minor %u, "
 				"using placeholder path\n", dmaj, dmin);
 		}
@@ -990,6 +990,8 @@ CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__DUMP_EXT_FILE, cuda_plugin_dump_file)
 #define MAX_NVIDIA_FILES 512
 static struct {
 	int id;
+	unsigned int maj;
+	unsigned int min;
 	char path[PATH_MAX];
 } nvidia_file_map[MAX_NVIDIA_FILES];
 static int nvidia_file_map_count = 0;
@@ -1023,28 +1025,38 @@ static void load_nvidia_file_mappings(void)
 	pr_info("CUDA plugin: loading NVIDIA mappings via openat(img_dir_fd=%d, %s)\n",
 		img_dir_fd, NVIDIA_FILES_IMG);
 
-	while (fscanf(fp, "%d %255s", &id, path) == 2) {
-		if (nvidia_file_map_count >= MAX_NVIDIA_FILES) {
-			pr_warn("CUDA plugin: too many NVIDIA files, truncating\n");
-			break;
+	{
+		unsigned int fmaj, fmin;
+		while (fscanf(fp, "%d %u %u %255s", &id, &fmaj, &fmin, path) == 4) {
+			if (nvidia_file_map_count >= MAX_NVIDIA_FILES) {
+				pr_warn("CUDA plugin: too many NVIDIA files, truncating\n");
+				break;
+			}
+			nvidia_file_map[nvidia_file_map_count].id = id;
+			nvidia_file_map[nvidia_file_map_count].maj = fmaj;
+			nvidia_file_map[nvidia_file_map_count].min = fmin;
+			strncpy(nvidia_file_map[nvidia_file_map_count].path, path, sizeof(nvidia_file_map[0].path) - 1);
+			nvidia_file_map[nvidia_file_map_count].path[sizeof(nvidia_file_map[0].path) - 1] = '\0';
+			nvidia_file_map_count++;
 		}
-		nvidia_file_map[nvidia_file_map_count].id = id;
-		strncpy(nvidia_file_map[nvidia_file_map_count].path, path, 255);
-		nvidia_file_map[nvidia_file_map_count].path[255] = '\0';
-		nvidia_file_map_count++;
 	}
 	fclose(fp);
 	pr_info("CUDA plugin: loaded %d NVIDIA file mappings\n", nvidia_file_map_count);
 }
 
-static const char *find_nvidia_path_for_id(int id)
+static int find_nvidia_entry_for_id(int id, const char **out_path,
+				    unsigned int *out_maj, unsigned int *out_min)
 {
 	load_nvidia_file_mappings();
 	for (int i = 0; i < nvidia_file_map_count; i++) {
-		if (nvidia_file_map[i].id == id)
-			return nvidia_file_map[i].path;
+		if (nvidia_file_map[i].id == id) {
+			*out_path = nvidia_file_map[i].path;
+			*out_maj = nvidia_file_map[i].maj;
+			*out_min = nvidia_file_map[i].min;
+			return 0;
+		}
 	}
-	return NULL;
+	return -1;
 }
 
 int cuda_plugin_restore_file(int id, bool *retry_needed)
@@ -1059,43 +1071,41 @@ int cuda_plugin_restore_file(int id, bool *retry_needed)
 		return -ENOTSUP;
 	}
 
-	/* Look up the original path for this file ID */
-	path = find_nvidia_path_for_id(id);
-	if (path) {
-		fd = open(path, O_RDWR);
-		if (fd >= 0) {
-			pr_debug("CUDA plugin: restored id 0x%x as %s (fd=%d)\n", id, path, fd);
-			return fd;
-		}
-		/* Device doesn't exist in container — create it via mknod.
-		 * The ID encodes major:minor: (maj << 20) | (min << 8) | fd_num */
-		if (errno == ENOENT) {
-			unsigned int dmaj = (id >> 20) & 0xFFF;
-			unsigned int dmin = (id >> 8) & 0xFFF;
-			char parent[PATH_MAX];
-			strncpy(parent, path, sizeof(parent) - 1);
-			parent[sizeof(parent) - 1] = '\0';
-			/* mkdir parent directory if needed */
-			char *slash = strrchr(parent, '/');
-			if (slash && slash != parent) {
-				*slash = '\0';
-				mkdir(parent, 0755);
+	/* Look up the original path and device major:minor for this file ID */
+	{
+		unsigned int dmaj, dmin;
+		if (find_nvidia_entry_for_id(id, &path, &dmaj, &dmin) == 0) {
+			fd = open(path, O_RDWR);
+			if (fd >= 0) {
+				pr_debug("CUDA plugin: restored id 0x%x as %s (fd=%d)\n", id, path, fd);
+				return fd;
 			}
-			if (mknod(path, S_IFCHR | 0666, makedev(dmaj, dmin)) == 0 ||
-			    errno == EEXIST) {
-				fd = open(path, O_RDWR);
-				if (fd >= 0) {
-					pr_info("CUDA plugin: restored id 0x%x as %s "
-						"(created via mknod %u:%u, fd=%d)\n",
-						id, path, dmaj, dmin, fd);
-					return fd;
+			/* Device doesn't exist in container — create it via mknod */
+			if (errno == ENOENT && dmaj > 0) {
+				char parent[PATH_MAX];
+				strncpy(parent, path, sizeof(parent) - 1);
+				parent[sizeof(parent) - 1] = '\0';
+				char *slash = strrchr(parent, '/');
+				if (slash && slash != parent) {
+					*slash = '\0';
+					mkdir(parent, 0755);
 				}
+				if (mknod(path, S_IFCHR | 0666, makedev(dmaj, dmin)) == 0 ||
+				    errno == EEXIST) {
+					fd = open(path, O_RDWR);
+					if (fd >= 0) {
+						pr_info("CUDA plugin: restored id 0x%x as %s "
+							"(created via mknod %u:%u, fd=%d)\n",
+							id, path, dmaj, dmin, fd);
+						return fd;
+					}
+				}
+				pr_warn("CUDA plugin: mknod %s (%u:%u) failed: %s\n",
+					path, dmaj, dmin, strerror(errno));
+			} else {
+				pr_warn("CUDA plugin: can't open %s for id 0x%x: %s\n",
+					path, id, strerror(errno));
 			}
-			pr_warn("CUDA plugin: mknod %s (%u:%u) failed: %s\n",
-				path, dmaj, dmin, strerror(errno));
-		} else {
-			pr_warn("CUDA plugin: can't open saved path %s for id 0x%x: %s\n",
-				path, id, strerror(errno));
 		}
 	}
 
