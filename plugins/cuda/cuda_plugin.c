@@ -1067,8 +1067,36 @@ int cuda_plugin_restore_file(int id, bool *retry_needed)
 			pr_debug("CUDA plugin: restored id 0x%x as %s (fd=%d)\n", id, path, fd);
 			return fd;
 		}
-		pr_warn("CUDA plugin: can't open saved path %s for id 0x%x: %s\n",
-			path, id, strerror(errno));
+		/* Device doesn't exist in container — create it via mknod.
+		 * The ID encodes major:minor: (maj << 20) | (min << 8) | fd_num */
+		if (errno == ENOENT) {
+			unsigned int dmaj = (id >> 20) & 0xFFF;
+			unsigned int dmin = (id >> 8) & 0xFFF;
+			char parent[PATH_MAX];
+			strncpy(parent, path, sizeof(parent) - 1);
+			parent[sizeof(parent) - 1] = '\0';
+			/* mkdir parent directory if needed */
+			char *slash = strrchr(parent, '/');
+			if (slash && slash != parent) {
+				*slash = '\0';
+				mkdir(parent, 0755);
+			}
+			if (mknod(path, S_IFCHR | 0666, makedev(dmaj, dmin)) == 0 ||
+			    errno == EEXIST) {
+				fd = open(path, O_RDWR);
+				if (fd >= 0) {
+					pr_info("CUDA plugin: restored id 0x%x as %s "
+						"(created via mknod %u:%u, fd=%d)\n",
+						id, path, dmaj, dmin, fd);
+					return fd;
+				}
+			}
+			pr_warn("CUDA plugin: mknod %s (%u:%u) failed: %s\n",
+				path, dmaj, dmin, strerror(errno));
+		} else {
+			pr_warn("CUDA plugin: can't open saved path %s for id 0x%x: %s\n",
+				path, id, strerror(errno));
+		}
 	}
 
 	/* Fallback: try to reconstruct device path from the ID.
