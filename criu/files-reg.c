@@ -2404,9 +2404,15 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			snprintf(tmp_path, sizeof(tmp_path), "%s.cr_link", orig_path);
 			pr_debug("Fake %s -> %s link\n", rfi->remap->rpath, rfi->path);
 
-			if (rfi_remap(rfi, &level)) {
+			ret = rfi_remap(rfi, &level);
+			if (ret < 0) {
 				pr_perror("Can't create even fake link!");
 				goto err;
+			}
+			if (ret == 1) {
+				/* .cr_link already exists — another process sharing
+				 * the same ghost file created it first. Just reuse. */
+				pr_debug("Fake link %s already exists, reusing\n", rfi->path);
 			}
 		} else if (ret < 0) {
 			pr_perror("Can't link %s -> %s", rfi->remap->rpath, rfi->path);
