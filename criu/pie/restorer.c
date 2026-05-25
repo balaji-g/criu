@@ -1100,6 +1100,7 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 	unsigned int i, flags;
 	long ring_fd, ret;
 	uint32_t *sq_array;
+	int kernel_rejected_mmap = 0;
 
 	memzero(&p, sizeof(p));
 
@@ -1122,7 +1123,21 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 	pr_err("io_uring: setup fd=%ld sq=%u cq=%u (target fd=%u)\n",
 	       ring_fd, p.sq_entries, p.cq_entries, ring->fd);
 
-	/* mmap ring VMAs at original addresses */
+	/* Try to mmap captured ring VMAs at their original addresses.
+	 *
+	 * On kernel 6.x+, the kernel rejects MAP_FIXED on io_uring fds with
+	 * EINVAL (verified on 6.12.68 GKE COS and 6.17 upstream; see gpucr
+	 * issue #41 + tests/iouring/). When that happens we degrade to
+	 * "libuv-recovery mode": leave the captured VAs unmapped, keep the
+	 * fresh io_uring fd at the original fd number (via dup2 below), and
+	 * rely on the workload's libuv to detect the CRIU restore marker and
+	 * call uv_loop_fork() — which tears down + recreates the ring with
+	 * fresh kernel-chosen mappings. This is the only viable approach
+	 * since:
+	 *   - mremap on io_uring fd: also rejected by kernel
+	 *   - NO_MMAP path: only handles SQ/CQ rings, not separate SQES VA
+	 * Verified mechanically via tests/iouring/test_uv_loop_fork_recovery.c.
+	 */
 	for (i = 0; i < ring->n_vmas; i++) {
 		unsigned long addr = ring->vmas[i].addr;
 		unsigned long size = ring->vmas[i].size;
@@ -1136,6 +1151,12 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 		pr_err("io_uring: mmap addr=%lx size=%lx pgoff=%lx -> %lx\n",
 		       addr, size, pgoff, mapped);
 		if (mapped != (long)addr) {
+			if (mapped == -EINVAL) {
+				pr_err("io_uring: kernel rejected MAP_FIXED on io_uring fd "
+				       "(kernel >= 6.x); degrading to libuv-recovery mode\n");
+				kernel_rejected_mmap = 1;
+				break;
+			}
 			pr_err("io_uring mmap failed (expected %lx got %ld)\n",
 			       addr, mapped);
 			sys_close(ring_fd);
@@ -1143,9 +1164,11 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 		}
 	}
 
-	/* Initialize SQ array: sqarray[i] = i */
-	if (p.sq_off.array) {
-		/* Find the SQ ring VMA (pgoff == IORING_OFF_SQ_RING == 0) */
+	/* Initialize SQ array (sq_array[i] = i) only when we successfully
+	 * mmap'd the SQ_RING VMA. In libuv-recovery mode the captured VAs are
+	 * unmapped — writing to them would SIGSEGV — and the workload will
+	 * reinit the ring itself on first event-loop tick. */
+	if (!kernel_rejected_mmap && p.sq_off.array) {
 		for (i = 0; i < ring->n_vmas; i++) {
 			if (ring->vmas[i].pgoff == IORING_OFF_SQ_RING) {
 				unsigned int j;
@@ -1157,7 +1180,10 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 		}
 	}
 
-	/* Place ring fd at the correct descriptor number */
+	/* Place ring fd at the correct descriptor number. We do this even in
+	 * libuv-recovery mode so that libuv finds a valid (empty) io_uring at
+	 * the expected fd. uv__iou_delete will close+munmap that fd shortly
+	 * after, then uv__iou_init creates the real working ring. */
 	if ((unsigned long)ring_fd != ring->fd) {
 		ret = sys_dup2(ring_fd, ring->fd);
 		pr_err("io_uring: dup2(%ld, %u) -> %ld\n",
@@ -1169,8 +1195,9 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 		sys_close(ring_fd);
 	}
 
-	pr_err("io_uring: restored fd=%u sq=%u cq=%u vmas=%u\n",
-	       ring->fd, ring->sq_entries, ring->cq_entries, ring->n_vmas);
+	pr_err("io_uring: restored fd=%u sq=%u cq=%u vmas=%u mode=%s\n",
+	       ring->fd, ring->sq_entries, ring->cq_entries, ring->n_vmas,
+	       kernel_rejected_mmap ? "libuv-recovery" : "exact");
 	return 0;
 }
 
