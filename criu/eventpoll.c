@@ -152,11 +152,26 @@ int flush_eventpoll_dinfo_queue(void)
 			pr_debug("kid_lookup_epoll: rbsearch match pid %d efd %d tfd %d toff %u -> %d\n", dinfo->pid,
 				 dinfo->efd, tfde->tfd, dinfo->toff[i].off, t->idx);
 
-			/* Make sure the pid matches */
+			/*
+			 * A PID mismatch here is legitimate for fd inherited
+			 * across fork: the kid_elem registry stores one
+			 * (pid, idx) per (genid, efd, tfd, toff) slot, but
+			 * multiple processes can share the same epoll fd
+			 * via fork-inheritance (e.g. NIM/Riva multi-process
+			 * servers, where the parent's epoll is dup'd into N
+			 * workers). kid_lookup_epoll_tfd_sub already invoked
+			 * the kernel's kcmp(KCMP_EPOLL_TFD) which
+			 * authoritatively verifies the two processes' epoll
+			 * entries reference the same underlying file, so the
+			 * shared kid->idx is correct for both sides. The
+			 * earlier strict pid==dinfo->pid check rejected
+			 * shared-fork epolls and made CRIU dump fail at
+			 * cr-dump.c:1756 ("Dump eventpoll failed with -1")
+			 * on workloads like whisper NIM. (nvcryo#175.)
+			 */
 			if (t->pid != dinfo->pid) {
-				pr_debug("kid_lookup_epoll: pid mismatch %d %d efd %d tfd %d toff %u\n", dinfo->pid,
-					 t->pid, dinfo->efd, tfde->tfd, dinfo->toff[i].off);
-				goto err;
+				pr_debug("kid_lookup_epoll: pid %d shares fd-inherited epoll with pid %d (efd %d tfd %d toff %u) — accepting\n",
+					 dinfo->pid, t->pid, dinfo->efd, tfde->tfd, dinfo->toff[i].off);
 			}
 
 			tfde->tfd = t->idx;
