@@ -1338,11 +1338,11 @@ static int restore_io_uring_ring(struct rst_io_uring_ring *ring)
 			ring->sq_head, ring->sq_tail, ring->cq_head, ring->cq_tail);
 	}
 
-	/* If the fd doesn't match, dup2 it to the expected fd */
+	/* If the fd does not match, dup3 it to the expected fd (aarch64 has no dup2) */
 	if ((unsigned int)fd != ring->fd) {
-		ret = sys_dup2(fd, ring->fd);
+		ret = sys_dup3(fd, ring->fd, 0);
 		if (ret < 0) {
-			pr_err("Failed to dup2 io_uring fd %d to %u: %ld\n",
+			pr_err("Failed to dup3 io_uring fd %d to %u: %ld\n",
 			       fd, ring->fd, ret);
 			sys_close(fd);
 			return -1;
