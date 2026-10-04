@@ -625,18 +625,14 @@ int cuda_plugin_resume_devices_late(int pid)
 	 * to be in a "running" state after restore, even if it was
 	 * in a "locked" or "checkpointed" state during `criu dump`.
 	 *
-	 * If cuda-checkpoint is not available or fails, we continue anyway.
-	 * The application may be using external GPU checkpoint/restore
-	 * (e.g., via GPUCR library and SIGUSR1/SIGUSR2 signals).
+	 * External GPU checkpoint/restore must opt out explicitly using
+	 * CRYO_SKIP_CUDA_CHECKPOINT. Otherwise, propagate restore failures
+	 * so CRIU cannot report success with checkpointed CUDA workers.
 	 */
 	ret = resume_device(pid, 1, CUDA_TASK_RUNNING);
-	if (ret != 0) {
-		pr_warn("CUDA plugin: resume_device failed for PID %d (ret=%d), "
-			"continuing anyway (external GPU restore may be used)\n", pid, ret);
-		/* Return 0 to not fail the restore - let external restore handle it */
-		return 0;
-	}
-	return 0;
+	if (ret != 0)
+		pr_err("CUDA plugin: resume_device failed for PID %d (ret=%d)\n", pid, ret);
+	return ret;
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_devices_late)
 
